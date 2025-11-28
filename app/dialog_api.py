@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import memory, retriever
+from app import retriever
 from app.utils import chat, get_personas_cache, get_character_name_by_id, get_text_around_position
 
 # ログ設定
@@ -79,13 +79,6 @@ class Citation(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: List[str]
-
-
-class HistoryMessage(BaseModel):
-    role: str
-    content: str
-    pos: Optional[int]
-    timestamp: str
 
 
 # エンドポイント
@@ -307,14 +300,6 @@ def chat_endpoint(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"内部エラー: {str(e)}")
 
 
-@app.get("/sessions/{session_id}", response_model=List[HistoryMessage])
-def get_session_history(session_id: str):
-    """セッション履歴を取得"""
-    if not memory.session_exists(session_id):
-        raise HTTPException(status_code=404, detail="セッションが見つかりません")
-
-    history = memory.get_session_history(session_id)
-    return history
 
 
 # ヘルパー関数
