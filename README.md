@@ -73,7 +73,7 @@ python app/index_chunks_qdrant.py
 ```
 
 このスクリプトは以下を実行します：
-1. `data/chunks.jsonl` を読み込み（約 300 チャンク）
+1. `data/chunks.jsonl` を読み込み（1,002 チャンク）
 2. OpenAI Embeddings API で各チャンクをベクトル化
 3. Qdrant の `neko_scenes` コレクションにインデックスを作成
 
