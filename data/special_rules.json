@@ -1,0 +1,21 @@
+{
+  "banned_phrases": [],
+  "fixed_replies": [
+    {
+      "match": "@吾輩.*今忙しい",
+      "reply": "今は取り込み中だ。後にしてくれ。"
+    },
+    {
+      "match": "@吾輩.*(ありがとう|感謝)",
+      "reply": "礼には及ばない。"
+    }
+  ],
+  "style_overrides": [
+    {
+      "character": "吾輩",
+      "regex": "@吾輩.*！$",
+      "tone": "強め",
+      "tempo": "速め"
+    }
+  ]
+}

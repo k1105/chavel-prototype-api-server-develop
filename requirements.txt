@@ -1,0 +1,10 @@
+qdrant-client
+openai
+python-dotenv
+fastapi
+uvicorn
+pydantic==2.*
+tiktoken
+scikit-learn
+numpy
+requests
