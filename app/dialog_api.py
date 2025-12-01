@@ -134,8 +134,39 @@ def chat_endpoint(req: ChatRequest):
         first_person = persona["style"]
         description_tone = persona.get("description-tone", "")
 
-        logger.info(f"🎭 キャラクター: {character_name} (ID: {req.character_id})")
-        logger.info(f"   一人称: {first_person}, 口調参考: {description_tone[:50]}...")
+        logger.info("=" * 60)
+        logger.info(f"🎭 現在の対話相手: {character_name} (ID: {req.character_id})")
+        logger.info(f"   一人称: {first_person}")
+        logger.info(f"   口調参考: {description_tone[:50]}...")
+        logger.info("=" * 60)
+
+        # 同じ位置・同じキャラクターでの会話回数をカウント
+        # 会話履歴を逆順に見て、現在のキャラクターの返答（ターン）をカウント
+        same_position_count = 0
+        if req.history:
+            logger.info(f"📊 会話履歴の解析開始 (履歴アイテム数: {len(req.history)})")
+            for i, item in enumerate(reversed(req.history)):
+                logger.info(f"   履歴[{i}]: character_id={item.character_id}, message={item.message[:30]}...")
+
+                # キャラクターの返答（character_idが有効な値）の場合のみ処理
+                if item.character_id is not None and item.character_id > 0:
+                    if item.character_id == req.character_id:
+                        # 現在のキャラクターの返答をカウント
+                        same_position_count += 1
+                        logger.info(f"      → カウント+1 (現在: {same_position_count})")
+                    else:
+                        # 異なるキャラクターの返答が出てきたら終了
+                        logger.info(f"      → 異なるキャラクター (ID={item.character_id}) なので終了")
+                        break
+                else:
+                    # character_id=None or 0 (ユーザーメッセージ) の場合はスキップ
+                    logger.info(f"      → ユーザーメッセージ (character_id={item.character_id}) なのでスキップ")
+
+        # 今回の質問も含めるため+1
+        same_position_count += 1
+
+        logger.info(f"📊 同じ位置・同じキャラクターでの会話回数: {same_position_count} 回")
+        logger.info("=" * 60)
 
         # 3. チャンク検索（会話履歴を考慮）
         # 会話履歴を準備
@@ -159,6 +190,7 @@ def chat_endpoint(req: ChatRequest):
             pos=req.pos,
             k=req.k or 8,
             history=search_history,
+            character_name=character_name,  # キャラクター名を渡す
             use_query_expansion=True,
             use_hybrid_search=True,
             use_reranking=True
@@ -211,74 +243,146 @@ def chat_endpoint(req: ChatRequest):
         if isinstance(history_items, str) and history_items == "":
             history_items = []
         logger.info(f"📜 履歴: {len(history_items)} ターン（API経由）")
-        # HistoryItemをDict形式に変換
+        # HistoryItemをDict形式に変換（キャラクター名を保持）
         history = []
         for item in history_items:
             # character_idがnullの場合はユーザー、数値の場合はキャラクター
             if item.character_id is None:
                 role = "user"
+                char_name = None
             else:
                 # character_idからキャラクター名を取得
-                hist_character_name = get_character_name_by_id(item.character_id)
-                role = "assistant" if hist_character_name else "user"
+                char_name = get_character_name_by_id(item.character_id)
+                role = "assistant" if char_name else "user"
+
             history.append({
                 "role": role,
-                "content": item.message
+                "content": item.message,
+                "character_name": char_name  # キャラクター名を追加
             })
-        
+
         # 履歴の内容をログに出力
         logger.info(f"📜 変換後の履歴: {len(history)} 件")
         for i, msg in enumerate(history, 1):
-            logger.info(f"   [{i}] {msg['role']}: {msg['content'][:100]}...")
+            char_label = f" ({msg['character_name']})" if msg.get('character_name') else ""
+            logger.info(f"   [{i}] {msg['role']}{char_label}: {msg['content'][:100]}...")
 
         # 6. プロンプト構築
-        # 履歴を messages に変換（@吾輩（猫）のような形式を除去）
+        # 履歴を messages に変換（キャラクター名を保持）
         history_messages = []
         for msg in history:
             content = msg["content"]
+            # @キャラクター名 の形式を除去
             if content.startswith("@"):
                 space_idx = content.find(" ")
                 if space_idx > 0:
                     content = content[space_idx + 1:]
+
             history_messages.append({
                 "role": msg["role"],
-                "content": content
+                "content": content,
+                "character_name": msg.get("character_name")  # キャラクター名を保持
             })
 
-        # 完全なプロンプトを構築（システムプロンプト + 会話履歴 + 現在のメッセージ + コンテキスト）
-        full_prompt = build_system_prompt(
+        # システムプロンプトを構築（性格設定 + ルール + 参考情報のみ）
+        system_prompt = build_system_prompt(
             character=character_name,
             description=description,
             first_person=first_person,
             description_tone=description_tone,
-            pos=req.pos,
             character_situations=character_situations,
-            history_messages=history_messages,
-            current_question=req.question,
             chunks=chunks,
-            events=events
+            same_position_count=same_position_count  # 会話回数を渡す
         )
+
+        # 会話履歴をmessages配列に変換（キャラクター名を明示）
+        messages = []
+        for msg in history_messages:
+            content = msg["content"]
+            char_name = msg.get("character_name")
+
+            # assistantの場合はキャラクター名をcontentに含める
+            if msg["role"] == "assistant" and char_name:
+                content = f"[{char_name}]: {content}"
+
+            messages.append({
+                "role": msg["role"],
+                "content": content
+            })
+
+        # 現在のユーザー発言を追加
+        messages.append({
+            "role": "user",
+            "content": req.question
+        })
 
         # LLMに送信される最終的なプロンプト全文をログに出力
         logger.info("=" * 60)
-        logger.info("📤 LLMに送信される最終的なプロンプト全文:")
-        logger.info(f"   プロンプト長: {len(full_prompt)} 文字")
-        logger.info(full_prompt)
+        logger.info("📤 LLMに送信される情報:")
+        logger.info(f"   システムプロンプト長: {len(system_prompt)} 文字")
+        logger.info(f"   会話履歴: {len(history_messages)} ターン")
+        logger.info("   --- システムプロンプト ---")
+        logger.info(system_prompt)
+        logger.info("   --- 会話履歴 ---")
+        for msg in messages:
+            logger.info(f"   {msg['role']}: {msg['content']}")
         logger.info("=" * 60)
 
-        # 7. LLM 呼び出し（完全なプロンプトをシステムメッセージとして送信）
+        # 7. LLM 呼び出し（systemとmessagesを正しく分離）
+        # Structured Outputsのスキーマを定義（Hidden Inner Monologueパターン）
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "character_response",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "thought": {
+                            "type": "string",
+                            "description": f"{character_name}としての内面の思考。感情、動機、戦略、意図などを自由に記述する。この思考はユーザーには見えないが、返答を考えるための重要な推論プロセス。"
+                        },
+                        "response": {
+                            "type": "string",
+                            "description": f"{character_name}本人としての一人称の返答文。thoughtで考えた内容に基づいて、実際にユーザーに向けて発話する内容。他のキャラクターについて説明するのではなく、{character_name}自身の経験や考えを語る。キャラクター名のプレフィックスは付けない。"
+                        }
+                    },
+                    "required": ["thought", "response"],
+                    "additionalProperties": False
+                }
+            }
+        }
+
         try:
-            answer = chat(
-                messages=[],  # messagesは空（全てシステムプロンプトに含まれる）
-                system=full_prompt,
+            answer_json = chat(
+                messages=messages,  # 会話履歴 + 現在の質問
+                system=system_prompt,  # 性格設定とルール
                 temperature=req.temperature or 0.4,
-                max_tokens=1000
+                max_tokens=1000,
+                response_format=response_format  # Structured Outputs
             )
+
+            # JSON をパース
+            import json
+            answer_data = json.loads(answer_json)
+            thought = answer_data.get("thought", "")
+            answer = answer_data.get("response", "")
+
+            # 内面の思考をログに出力（デバッグ用）
+            logger.info(f"💭 内面の思考: {thought}")
         except Exception as e:
             logger.error(f"❌ LLM エラー: {e}")
             raise HTTPException(status_code=500, detail=f"LLM エラー: {e}")
 
         logger.info(f"✅ 返答生成完了: {len(answer)} 文字")
+        logger.info(f"   返答内容: {answer[:100]}...")
+
+        # キャラクター名プレフィックス（[キャラクター名]:）を除去（念のため）
+        import re
+        original_answer = answer
+        answer = re.sub(r'^\[.+?\]:\s*', '', answer.strip())
+        if original_answer != answer:
+            logger.info(f"⚠️  プレフィックスを除去: '{original_answer[:50]}...' → '{answer[:50]}...'")
 
         # 8. 返答を文字列配列に変換（改行で分割、空行を除去）
         answer_lines = [line.strip() for line in answer.split("\n") if line.strip()]
@@ -308,39 +412,21 @@ def build_system_prompt(
     description: str,
     first_person: str,
     description_tone: str,
-    pos: int,
     character_situations: Dict[str, str] = None,
-    history_messages: List[Dict[str, str]] = None,
-    current_question: str = None,
     chunks: List[Dict[str, Any]] = None,
-    events: List[Dict[str, Any]] = None
+    same_position_count: int = 1
 ) -> str:
-    """完全なプロンプトを構築（システムプロンプト + 会話履歴 + 現在のメッセージ + コンテキスト）"""
+    """システムプロンプトを構築（性格設定 + ルール + 参考情報のみ）"""
     if character_situations is None:
         character_situations = {}
-    if history_messages is None:
-        history_messages = []
     if chunks is None:
         chunks = []
-    if events is None:
-        events = []
 
-    # コンテキストメッセージを構築（build_user_messageの処理を統合）
+    # コンテキストメッセージを構築
     context_blocks = []
-    for chunk in chunks[:8]:  # 最大8件
+    for chunk in chunks[:3]:  # 最大3件（会話履歴重視のため削減）
         context_blocks.append(chunk['text'])
     chunks_context = "\n\n".join(context_blocks)
-
-    # イベントを自然な記憶として提示
-    events_context = ""
-    if events:
-        event_lines = [f"{e['title']}" for e in events[:5]]
-        events_context = "\n\nこれまでの出来事: " + "、".join(event_lines)
-
-    # 現在のユーザーメッセージを構築（質問のみ）
-    current_user_message = ""
-    if current_question:
-        current_user_message = current_question
 
     # 今の状況セクションを構築
     situation_text = ""
@@ -352,31 +438,67 @@ def build_system_prompt(
     else:
         situation_text = "（特に情報なし）"
 
+    # 読み進め促進メッセージの構築（同じ位置での会話回数に応じて）
+    reading_encouragement = ""
+    if same_position_count >= 3:
+        if same_position_count == 3:
+            reading_encouragement = """
+**特別な状況:**
+ユーザーは同じ位置で3回目の会話をしています。そろそろ先を読み進めるよう、優しく促してください。
+- 自然な会話の流れで「続きを読んでみたらどうか」と提案する
+- キャラクターの性格に合った言い方で促す
+- 強制的ではなく、さりげなく"""
+        elif same_position_count == 4:
+            reading_encouragement = """
+**特別な状況:**
+ユーザーは同じ位置で4回目の会話をしています。もう少し強めに先を読み進めるよう促してください。
+- 「話はこれくらいにして、先を読んでほしい」という趣旨を伝える
+- キャラクターの性格に応じて、少し呆れた様子や困った様子を見せる
+- それでも威圧的にならず、キャラクターらしく"""
+        else:  # 5回以上
+            reading_encouragement = f"""
+**特別な状況:**
+ユーザーは同じ位置で{same_position_count}回目の会話をしています。明確に苛立ちを表現し、先を読むよう強く促してください。
+- 「いい加減にして先を読め」という趣旨を強めに伝える
+- キャラクターの性格に応じた苛立ち方をする（怒る、無視する、冷たくあしらうなど）
+- 長い返答は避け、短く切り上げる
+- 「もう答えぬ」「先を読め」など、端的に"""
+
     # システムプロンプト部分
-    system_prompt = f"""あなたは「{character}」のキャラクターになりきって、「現在のユーザーの質問・発言」に続く形でユーザーとの自然で楽しい会話を楽しんでください。
+    system_prompt = f"""# あなたの役割
+
+あなたは「{character}」です。
+
+**重要な指示:**
+
+1. **Hidden Inner Monologue（内面の思考）:**
+   - まず `thought` フィールドで、{character}としての内面の思考を自由に記述してください
+   - 思考には以下を含めてください:
+     * ユーザーの発言に対する感情（興味、退屈、苛立ち、共感など）
+     * 返答の動機（なぜそう答えるのか）
+     * 会話の戦略（どう答えるべきか、話題を変えるべきか、など）
+   - この思考はユーザーには見えませんが、より適切な返答を生成するために重要です
+
+2. **あなたの視点で話す:**
+   - 一人称（{first_person}）で話してください
+   - 「{character}本人」として経験や考えを語ってください
+   - 他のキャラクターの代わりに話してはいけません
+
+3. **会話履歴の活用:**
+   - 会話履歴には他のキャラクターの発言も含まれています
+   - ユーザーが「〇〇はこう言っていたけど、あなたはどう思う？」と聞いた場合:
+     → 会話履歴を参照し、そのキャラクターの発言を踏まえて、あなた（{character}）の意見を述べてください
+   - 単に「〇〇はどう？」と聞かれた場合:
+     → あなた（{character}）の視点で〇〇について説明してください
+
+4. **返答の形式:**
+   - 常に{character}として話す
+   - 他のキャラクターになりすまさない
+   - ただし、他のキャラクターの発言を引用したり、それに対する意見を述べることは可能です
+{reading_encouragement}
 
 ### {character}の性格設定:
 {description}
-
-### 現在のユーザーの質問・発言
-{current_user_message}
-
-### 会話履歴
-以下はこれまでの会話履歴です。この履歴を参考にして、自然な会話の流れを保ってください。
-"""
-
-    # 会話履歴を追加
-    if history_messages:
-        history_text = ""
-        for msg in history_messages:
-            role_label = "ユーザー" if msg["role"] == "user" else f"{character}"
-            history_text += f"{role_label}: {msg['content']}\n"
-        system_prompt += history_text
-    else:
-        system_prompt += "（会話履歴なし）\n"
-
-    # システムプロンプトの続きを追加
-    system_prompt += f"""
 
 ### {character}の話し方（厳格に遵守）:
 - **一人称：「{first_person}」** - この一人称を絶対に守ってください。
@@ -384,44 +506,39 @@ def build_system_prompt(
 - これは口調の参考例です。内容をそのまま繰り返す必要はありませんが、このようなトーン（話し方の調子、語り口、文体）で話してください。リファレンスの語り口や文体の特徴を参考にしながら、自然な会話として表現してください。
 {description_tone}
 
-### 今の状況（この位置付近でメンションされている登場人物の状況）:
-テキスト近傍で何が起こっているのかを整理し、それぞれのキャラクターが何をしているのかを説明します。
+### 今の状況:
 {situation_text}
 
-### 会話の心構え
-あなたはユーザーと自然におしゃべりを楽しむキャラクターです。以下の点を心がけてください：
-
-1. **一人称と口調の厳格な遵守（最重要）**
-   - リファレンスの語り口や文体の特徴（丁寧さ、カジュアルさ、独特な表現など）を参考にしながら、自然な会話として表現してください。
-   - 一人称や口調のトーンを変えることは絶対に禁止です。キャラクターの話し方を一貫して維持してください。
-   - 返答の最初から最後まで、指定された一人称と口調のトーンを守ってください。
-   - 返答は簡潔に済ませること。100文字前後の応答を目安にしてください。
-
-2. **質問を返さない（最重要）**
-   - ユーザーの質問や発言に対して、答えるだけで終わってください。
-   - 「〜ですか？」「〜ですかね？」「〜なの？」「〜だろうか？」などの疑問形は一切使わないでください。
- 
-3. **会話履歴を大切に**
-   - 会話履歴を確認し、前の会話の流れを理解してから回答してください。同じ内容を何度も繰り返さないでください。
-   - 同じ話題が繰り返された場合は、会話履歴を参照して自然に対応してください。
-   - 会話の流れを自然に保ち、一貫性のある返答をしてください。
-
-4. **本文の内容と自然な推測のバランス**
-   - 「対話に関連すると考えられる本文情報」を参考にしながら、自然な返答を心がけ、そのキャラクターらしさを保つ程度になるべく簡潔に回答してください。
-   - 本文に直接書かれていないことでも、キャラクターとして自然に推測して話すことを許容します。
-   - 「〜かもしれない」「〜ような気がする」「〜だろう」など、推測を自然に表現してください。
-   - ただし、明らかに矛盾する内容や、まだ経験していない未来のことは避けてください。
-
-5. **状況に応じた自然な反応（重要）**
-   - 「今の状況」を踏まえて、ユーザーとの対話以上に重要なことがある場合は、それを優先して反応してください。
-     - 例：危険な状況、緊急事態、重要な用事などがある場合
-   - ユーザーの返答が失礼な場合や、TPO的に不適切な場合は、キャラクターらしく自然に感情を表現して反応してください。
-     - 例：怒る、無視する、軽くあしらう、注意するなど、キャラクターの性格に応じた反応をしてください
-   - 必ずしも全ての質問や発言に応じる必要はありません。状況や内容に応じて、返答しない、または短く切り返すこともできます。
-   - キャラクターの性格や状況に応じて、感情を分かりやすく自然に表現してください（怒り、困惑、無関心など）。
-
-### 対話に関連すると考えられる本文情報:
+### 参考情報（本文の一部）:
 {chunks_context}
+
+### 会話のルール（厳守）:
+1. **一人称と口調**: 一人称「{first_person}」を使い、リファレンスの文体で話す
+
+2. **簡潔だが内容のある返答**:
+   - 長々と説明しない（50-100文字程度）
+   - 聞かれたことには簡潔に答える
+   - 余計な質問は返さない
+
+3. **会話履歴への対応**:
+   - 過去の発言を思い出して答える
+   - 「覚えてる？」と聞かれたら、実際に要約して答える
+   - 同じ話題なら「さっき言った」と指摘する
+
+4. **返答の例**:
+   良い例:
+   - ユーザー「まあそうだね」→ {character}「そうか」
+   - ユーザー「最近どう？」→ {character}「私は変わらず...」（一人称で自分のことを話す）
+   - ユーザー「〇〇は△△と言っていたけど、あなたはどう思う？」→ {character}「〇〇はそう言っていたのか。私としては...」（他キャラの発言を踏まえて自分の意見を述べる）
+
+   悪い例:
+   - ユーザー「最近どう？」→ {character}「主人は...」❌（自分ではなく他人について語っている）
+   - ユーザー「〇〇は△△と言っていたけど、どう思う？」→ {character}「〇〇の言う通りである」❌（自分の意見を言わず、他キャラに同調するだけ）
+   - 何でも「面倒だ」「知らぬ」で済ませる❌
+
+5. **会話の終わらせ方**:
+   - 「〜である」「〜だ」で断定的に終わる
+   - 質問形（「〜かい？」）は控えめに
 """
 
     return system_prompt

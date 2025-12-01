@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 _qdrant_client = None
 COLLECTION_NAME = "neko_scenes"
 
+# 状況要約のキャッシュ（pos, character_name -> 要約テキスト）
+_situation_cache: Dict[Tuple[int, str], str] = {}
+
 
 def get_qdrant_client():
     """Qdrant クライアントを取得（利用可能な場合）"""
@@ -159,64 +162,121 @@ def search_semantic_fallback(
     return results
 
 
-def expand_query_with_history(question: str, history: List[Dict[str, str]] = None) -> str:
+def expand_query_with_history(
+    question: str,
+    history: List[Dict[str, str]] = None,
+    character_name: str = None,
+    pos: int = None
+) -> str:
     """
-    会話履歴を考慮して質問を拡張・リライト
-    
+    会話履歴、キャラクター情報、テキスト位置を考慮して質問を拡張・リライト
+
     Args:
         question: 現在の質問
         history: 会話履歴 [{"role": "user/assistant", "content": "..."}]
-    
+        character_name: 対話相手のキャラクター名（例: "吾輩"）
+        pos: 現在のテキスト位置
+
     Returns:
         拡張された質問文
     """
-    if not history or len(history) == 0:
+    if not question or len(question.strip()) == 0:
         return question
-    
-    # 直近の会話履歴を取得（最大3ターン）
-    recent_history = history[-6:] if len(history) > 6 else history
-    
-    # 履歴からキーワードや文脈を抽出
+
+    # 直近の会話履歴を取得（最大3ターン＝6メッセージ）
+    recent_history = []
+    if history and len(history) > 0:
+        recent_history = history[-6:] if len(history) > 6 else history
+
+    # 履歴からコンテキストを構築（キャラクター名を含める）
     history_context = ""
     for msg in recent_history:
-        role = msg.get("role", "")
+        char_name = msg.get("character_name")
+        if msg.get("role") == "user":
+            role_label = "ユーザー"
+        elif char_name:
+            role_label = char_name  # キャラクター名を使用
+        else:
+            role_label = "キャラクター"
+
         content = msg.get("content", "")
         if content:
-            history_context += f"{content}\n"
-    
+            history_context += f"{role_label}: {content}\n"
+
+    # キャラクター情報の取得
+    from app.utils import get_personas_cache
+    personas = get_personas_cache()
+    character_info = ""
+    if character_name and character_name in personas:
+        persona = personas[character_name]
+        character_info = f"\n対話相手: {character_name}\n"
+        # キャラクターの関係性情報を追加
+        if character_name == "吾輩":
+            character_info += "（吾輩の家主は「苦沙弥先生」、嫌いな人物は「おさん」、友人に「車屋の黒」などがいる）"
+
+    # 現在位置付近のテキストを取得（文脈のため）
+    position_context = ""
+    if pos is not None:
+        from app.utils import get_text_around_position
+        nearby_text = get_text_around_position(pos, context_chars=100)
+        if nearby_text:
+            position_context = f"\n現在のテキスト位置付近: {nearby_text}\n"
+
     # LLMを使って質問を拡張・リライト
     try:
         system_prompt = """あなたは検索クエリを改善するアシスタントです。
-会話履歴と現在の質問を考慮して、より検索に適した質問文にリライトしてください。
+会話履歴、キャラクター情報、テキスト位置を考慮して、小説本文の検索に最適な質問文にリライトしてください。
 
-以下の点を重視してください：
-- 会話履歴の文脈を考慮する
-- 質問の意図を明確にする
-- 具体的なキーワードを含める
-- 簡潔で検索に適した形にする（50文字以内を目安）
-- 元の質問の意図を変えない"""
-        
-        user_message = f"""会話履歴:
-{history_context}
+重要な処理：
+1. **代名詞・省略された主語の解決**:
+   - 「家主」→「苦沙弥先生」のように、キャラクター関係を考慮
+   - 「それ」「あれ」→ 会話履歴から具体的な対象を特定
+
+2. **時間表現の具体化**:
+   - 「最近」→「現在のテキスト位置付近で」
+   - 「その後」→「その出来事の後で」
+
+3. **文脈参照の解決**:
+   - 「具体的には？」→ 直前の話題を含めた質問に変換
+   - 「なぜ？」→ 何についての「なぜ」かを明確化
+
+4. **検索に適した形式**:
+   - 本文中に登場する言葉を使う
+   - 簡潔で具体的（30-60文字程度）
+   - 検索キーワードを含める
+
+出力は拡張された質問文のみを返してください。"""
+
+        user_message = f"""以下の情報をもとに、質問を検索に適した形にリライトしてください。
+
+{character_info}
+{position_context}
+会話履歴:
+{history_context if history_context else "（なし）"}
 
 現在の質問: {question}
 
-上記の会話履歴と現在の質問を考慮して、より検索に適した質問文にリライトしてください。"""
-        
+リライトされた質問:"""
+
         expanded = chat(
             messages=[{"role": "user", "content": user_message}],
             system=system_prompt,
-            temperature=0.3,
-            max_tokens=100
+            temperature=0.2,  # 0.3→0.2 より決定的に
+            max_tokens=150
         )
-        
+
         expanded = expanded.strip()
-        if expanded and len(expanded) > 10:  # 有効な結果の場合
+        # 引用符を除去
+        expanded = expanded.strip('"').strip("'").strip("「").strip("」")
+
+        if expanded and len(expanded) > 5:  # 有効な結果の場合
             logger.info(f"📝 質問拡張: '{question}' → '{expanded}'")
             return expanded
+        else:
+            logger.warning(f"⚠️  質問拡張結果が短すぎる: '{expanded}'")
     except Exception as e:
         logger.warning(f"⚠️  質問拡張エラー: {e}")
-    
+
     return question
 
 
@@ -361,6 +421,7 @@ def retrieve_chunks(
     k: int = 8,
     window: int = 3,
     history: List[Dict[str, str]] = None,
+    character_name: str = None,
     use_query_expansion: bool = True,
     use_hybrid_search: bool = True,
     use_reranking: bool = True
@@ -374,6 +435,7 @@ def retrieve_chunks(
         k: 取得チャンク数
         window: 近傍ウィンドウサイズ
         history: 会話履歴 [{"role": "user/assistant", "content": "..."}]
+        character_name: 対話相手のキャラクター名
         use_query_expansion: 質問拡張を使用するか
         use_hybrid_search: ハイブリッド検索を使用するか
         use_reranking: 再ランキングを使用するか
@@ -389,11 +451,16 @@ def retrieve_chunks(
     nearby = retrieve_nearby(current_scene, window=window)
     logger.info(f"📦 近傍チャンク: {len(nearby)} 件")
 
-    # 質問の拡張・リライト
+    # 質問の拡張・リライト（キャラクター情報とテキスト位置を考慮）
     search_query = question
-    if use_query_expansion and history:
-        search_query = expand_query_with_history(question, history)
-    
+    if use_query_expansion:
+        search_query = expand_query_with_history(
+            question=question,
+            history=history,
+            character_name=character_name,
+            pos=pos
+        )
+
     logger.info(f"🔍 検索クエリ: '{search_query}'")
 
     # セマンティック検索
@@ -418,17 +485,37 @@ def retrieve_chunks(
     combined = []
     scene_to_chunk = {}  # シーンごとの最良チャンクを保持
 
-    # 近傍を優先
-    nearby_added = 0
+    # 近傍チャンクの類似度を計算（質問との関連度が高いものだけ追加）
+    nearby_with_scores = []
     for chunk in nearby:
         if chunk["start_pos"] <= pos <= chunk["end_pos"] or chunk["end_pos"] <= pos:
+            # 質問との類似度を計算
+            chunk_text = chunk.get("text", "")
+            chunk_vec = embed(chunk_text)
+            similarity = cosine_similarity([query_vec], [chunk_vec])[0][0]
+            chunk["nearby_similarity"] = similarity
+            nearby_with_scores.append((chunk, similarity))
+
+    # 類似度でソートして、関連度の高い近傍チャンクのみ保持
+    nearby_with_scores.sort(key=lambda x: x[1], reverse=True)
+
+    # 類似度が一定以上（0.7以上）、または上位2件のみ追加
+    nearby_threshold = 0.7
+    nearby_added = 0
+    for i, (chunk, similarity) in enumerate(nearby_with_scores):
+        # 上位2件、または類似度0.7以上のチャンクのみ追加
+        if i < 2 or similarity >= nearby_threshold:
             scene_idx = chunk["scene_index"]
             if scene_idx not in seen_scenes:
                 seen_scenes.add(scene_idx)
                 chunk["source"] = "nearby"
-                chunk["score"] = chunk.get("score", 1.0) + 0.5  # 近傍はボーナス
+                chunk["score"] = similarity + 0.2  # 近傍ボーナスを削減（0.5→0.2）
                 scene_to_chunk[scene_idx] = chunk
                 nearby_added += 1
+                logger.info(f"   📌 近傍チャンク追加 (similarity={similarity:.3f}): scene={scene_idx}")
+        else:
+            logger.info(f"   ⏭️  近傍チャンクをスキップ (similarity={similarity:.3f} < {nearby_threshold}): scene={scene_idx}")
+
     logger.info(f"📌 近傍チャンク追加: {nearby_added}/{len(nearby)} 件")
 
     # セマンティック検索結果を追加
@@ -524,6 +611,12 @@ def get_current_situation(
     Returns:
         キャラクターの状況を要約したテキスト（常に何かしらの結果を返す）
     """
+    # キャッシュチェック
+    cache_key = (pos, character_name)
+    if cache_key in _situation_cache:
+        logger.info(f"✓ {character_name}の状況要約をキャッシュから取得 (pos={pos})")
+        return _situation_cache[cache_key]
+
     chunks = get_chunks_cache()
     current_scene = find_current_scene(pos)
 
@@ -616,6 +709,9 @@ def get_current_situation(
         if not result:
             result = "現在位置付近の状況は不明"
         logger.info(f"✓ {character_name}の状況要約結果: {result[:50]}...")
+
+        # キャッシュに保存
+        _situation_cache[cache_key] = result
         return result
     except Exception as e:
         logger.error(f"❌ 要約エラー ({character_name}): {e}")
@@ -624,7 +720,11 @@ def get_current_situation(
             fallback_text = relevant_texts[0]
             if len(fallback_text) > 200:
                 fallback_text = fallback_text[:200] + "..."
+            # フォールバック結果もキャッシュに保存
+            _situation_cache[cache_key] = fallback_text
             return fallback_text
         else:
             # それでも見つからない場合は、デフォルトメッセージを返す
-            return "現在位置付近の状況は不明"
+            default_msg = "現在位置付近の状況は不明"
+            _situation_cache[cache_key] = default_msg
+            return default_msg

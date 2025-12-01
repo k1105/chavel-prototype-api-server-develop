@@ -54,7 +54,8 @@ def chat(
     messages: List[Dict[str, str]],
     system: Optional[str] = None,
     temperature: float = 0.4,
-    max_tokens: int = 1000
+    max_tokens: int = 1000,
+    response_format: Optional[Dict] = None
 ) -> str:
     """LLM でチャット補完"""
     client = get_openai_client()
@@ -63,12 +64,19 @@ def chat(
     if system:
         messages = [{"role": "system", "content": system}] + messages
 
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens
-    )
+    # API呼び出しのパラメータを構築
+    params = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+
+    # response_formatが指定されている場合は追加
+    if response_format:
+        params["response_format"] = response_format
+
+    response = client.chat.completions.create(**params)
 
     return response.choices[0].message.content
 
