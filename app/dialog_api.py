@@ -5,6 +5,7 @@ FastAPI でキャラクターとの対話を提供
 """
 
 import logging
+import json
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="吾輩は猫である - 対話API",
     description="小説ベースの対話API（RAG + ネタバレ防止）",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # CORS 設定
@@ -67,7 +68,8 @@ class ChatRequest(BaseModel):
     pos: int = Field(..., description="本文の現在位置（文字オフセット）")
     question: str = Field(..., description="ユーザの質問")
     k: Optional[int] = Field(8, description="取得チャンク数")
-    temperature: Optional[float] = Field(0.4, description="LLM の temperature")
+    # 【変更】創造性を高めるため、デフォルトの temperature を 0.4 -> 0.7 に変更
+    temperature: Optional[float] = Field(0.7, description="LLM の temperature")
     history: Optional[List[HistoryItem]] = Field(default=[], description="これまでの会話履歴")
 
 
@@ -104,7 +106,7 @@ def chat_endpoint(req: ChatRequest):
         logger.info(f"   {text_around}")
         logger.info("=" * 60)
 
-        # 1. キャラクター名を取得（character_idがあればそれから、なければcharacterフィールドを使用）
+        # 1. キャラクター名を取得
         if req.character_id is not None:
             character_name = get_character_name_by_id(req.character_id)
             if character_name is None:
@@ -113,7 +115,6 @@ def chat_endpoint(req: ChatRequest):
                     detail=f"キャラクターID '{req.character_id}' が見つかりません"
                 )
         elif req.character:
-            # characterフィールドを直接使用
             character_name = req.character
         else:
             raise HTTPException(
@@ -133,158 +134,103 @@ def chat_endpoint(req: ChatRequest):
         description = persona["description-setting"]
         first_person = persona["style"]
         description_tone = persona.get("description-tone", "")
+        first_message = persona.get("first-message", "")
+        # 【追加】会話サンプルを取得
+        sample_dialogues = persona.get("sample_dialogues", [])
 
         logger.info("=" * 60)
         logger.info(f"🎭 現在の対話相手: {character_name} (ID: {req.character_id})")
         logger.info(f"   一人称: {first_person}")
-        logger.info(f"   口調参考: {description_tone[:50]}...")
+        logger.info(f"   会話サンプル数: {len(sample_dialogues)}")
         logger.info("=" * 60)
 
         # 同じ位置・同じキャラクターでの会話回数をカウント
-        # 会話履歴を逆順に見て、現在のキャラクターの返答（ターン）をカウント
         same_position_count = 0
         if req.history:
-            logger.info(f"📊 会話履歴の解析開始 (履歴アイテム数: {len(req.history)})")
-            for i, item in enumerate(reversed(req.history)):
-                logger.info(f"   履歴[{i}]: character_id={item.character_id}, message={item.message[:30]}...")
-
-                # キャラクターの返答（character_idが有効な値）の場合のみ処理
+            for item in reversed(req.history):
                 if item.character_id is not None and item.character_id > 0:
                     if item.character_id == req.character_id:
-                        # 現在のキャラクターの返答をカウント
                         same_position_count += 1
-                        logger.info(f"      → カウント+1 (現在: {same_position_count})")
                     else:
-                        # 異なるキャラクターの返答が出てきたら終了
-                        logger.info(f"      → 異なるキャラクター (ID={item.character_id}) なので終了")
                         break
-                else:
-                    # character_id=None or 0 (ユーザーメッセージ) の場合はスキップ
-                    logger.info(f"      → ユーザーメッセージ (character_id={item.character_id}) なのでスキップ")
-
-        # 今回の質問も含めるため+1
         same_position_count += 1
-
         logger.info(f"📊 同じ位置・同じキャラクターでの会話回数: {same_position_count} 回")
-        logger.info("=" * 60)
 
-        # 3. チャンク検索（会話履歴を考慮）
-        # 会話履歴を準備
+        # 3. チャンク検索（RAG）
         search_history = []
         if req.history:
             for item in req.history:
                 role = "user" if item.character_id is None else "assistant"
-                content = item.message
-                # @キャラクター名 の形式を除去
-                if content.startswith("@"):
-                    space_idx = content.find(" ")
-                    if space_idx > 0:
-                        content = content[space_idx + 1:]
-                search_history.append({
-                    "role": role,
-                    "content": content
-                })
+                content = item.message.replace(f"@{character_name} ", "").replace("@ ", "")
+                search_history.append({"role": role, "content": content})
         
         chunks, method = retriever.retrieve_chunks(
             question=req.question,
             pos=req.pos,
             k=req.k or 8,
             history=search_history,
-            character_name=character_name,  # キャラクター名を渡す
+            character_name=character_name,
             use_query_expansion=True,
             use_hybrid_search=True,
             use_reranking=True
         )
 
         if not chunks:
-            raise HTTPException(
-                status_code=400,
-                detail="該当するチャンクが見つかりませんでした（pos が範囲外の可能性）"
-            )
+            # チャンクが見つからない場合でも会話は成立させるため、空リストで続行（あるいはエラー）
+            logger.warning("⚠️ 該当するチャンクが見つかりませんでした。コンテキストなしで応答します。")
+            chunks = []
 
-        # 検索されたチャンクをログに出力
-        logger.info(f"📚 検索されたチャンク: {len(chunks)} 件")
-        for i, chunk in enumerate(chunks, 1):
-            logger.info(f"   [{i}] scene={chunk['scene_index']}, chapter={chunk['chapter']}, "
-                       f"pos={chunk['start_pos']}-{chunk['end_pos']}")
-            logger.info(f"       テキスト: {chunk['text'][:100]}...")
-
-        # 4. 関連イベント取得
+        # 4. 関連情報の収集
         current_scene = retriever.find_current_scene(req.pos)
-        events = retriever.retrieve_relevant_events(current_scene, chunks)
-
-        # 4.5. 現在位置付近の登場人物の状況を取得
-        # 対話相手（character_name）の状況を必ず取得
-        character_situations = {}
         
-        # まず対話相手の状況を取得（毎回実行）
+        # 登場人物の状況取得
+        character_situations = {}
         situation = retriever.get_current_situation(req.pos, character_name)
         character_situations[character_name] = situation
         
-        # 取得したチャンクから登場人物を抽出（対話相手以外）
         mentioned_characters = set()
         for chunk in chunks:
             for char in chunk.get("characters", []):
-                if char and char != character_name:  # 対話相手以外のキャラクター
+                if char and char != character_name:
                     mentioned_characters.add(char)
 
-        # 各キャラクターの状況を取得（毎回実行、結果は常に返される）
         for char in mentioned_characters:
             situation = retriever.get_current_situation(req.pos, char)
             character_situations[char] = situation
 
-        logger.info(f"👥 登場人物の状況: {len(character_situations)} 件")
-        for char, situation in character_situations.items():
-            logger.info(f"   - {char}: {situation[:100]}...")
-
-        # 5. 会話履歴取得（API経由で送られてくる履歴を使用）
+        # 5. 会話履歴の整備
         history_items = req.history if req.history is not None else []
-        # 空文字列の場合は空リストに変換
-        if isinstance(history_items, str) and history_items == "":
-            history_items = []
-        logger.info(f"📜 履歴: {len(history_items)} ターン（API経由）")
-        # HistoryItemをDict形式に変換（キャラクター名を保持）
+        if isinstance(history_items, str): history_items = []
+        
+        # first-message の挿入処理
+        if first_message and first_message.strip():
+            has_first_message = False
+            if history_items and len(history_items) > 0:
+                first_item = history_items[0]
+                if (first_item.character_id == req.character_id and 
+                    first_item.message == first_message):
+                    has_first_message = True
+            
+            if not has_first_message:
+                history_items = [HistoryItem(character_id=req.character_id, message=first_message)] + history_items
+        
+        # 履歴の変換
         history = []
         for item in history_items:
-            # character_idがnullの場合はユーザー、数値の場合はキャラクター
             if item.character_id is None:
                 role = "user"
                 char_name = None
             else:
-                # character_idからキャラクター名を取得
                 char_name = get_character_name_by_id(item.character_id)
                 role = "assistant" if char_name else "user"
 
             history.append({
                 "role": role,
                 "content": item.message,
-                "character_name": char_name  # キャラクター名を追加
+                "character_name": char_name
             })
-
-        # 履歴の内容をログに出力
-        logger.info(f"📜 変換後の履歴: {len(history)} 件")
-        for i, msg in enumerate(history, 1):
-            char_label = f" ({msg['character_name']})" if msg.get('character_name') else ""
-            logger.info(f"   [{i}] {msg['role']}{char_label}: {msg['content'][:100]}...")
 
         # 6. プロンプト構築
-        # 履歴を messages に変換（キャラクター名を保持）
-        history_messages = []
-        for msg in history:
-            content = msg["content"]
-            # @キャラクター名 の形式を除去
-            if content.startswith("@"):
-                space_idx = content.find(" ")
-                if space_idx > 0:
-                    content = content[space_idx + 1:]
-
-            history_messages.append({
-                "role": msg["role"],
-                "content": content,
-                "character_name": msg.get("character_name")  # キャラクター名を保持
-            })
-
-        # システムプロンプトを構築（性格設定 + ルール + 参考情報のみ）
         system_prompt = build_system_prompt(
             character=character_name,
             description=description,
@@ -292,44 +238,30 @@ def chat_endpoint(req: ChatRequest):
             description_tone=description_tone,
             character_situations=character_situations,
             chunks=chunks,
-            same_position_count=same_position_count  # 会話回数を渡す
+            same_position_count=same_position_count,
+            sample_dialogues=sample_dialogues  # 【追加】サンプルを渡す
         )
 
-        # 会話履歴をmessages配列に変換（キャラクター名を明示）
+        # Messagesの構築
         messages = []
-        for msg in history_messages:
-            content = msg["content"]
-            char_name = msg.get("character_name")
+        for msg in history:
+            content = msg["content"].replace(f"@{character_name} ", "").replace("@ ", "")
+            # assistantの場合は誰の発言か明記（マルチキャラ対応の布石）
+            if msg["role"] == "assistant" and msg.get("character_name"):
+                 # ここではLLMに「会話の流れ」として認識させるため、自分の発言には名前を付けず、
+                 # 他のキャラの発言があれば付ける等の制御が可能だが、
+                 # シンプルに history として渡す。
+                 pass
+            messages.append({"role": msg["role"], "content": content})
 
-            # assistantの場合はキャラクター名をcontentに含める
-            if msg["role"] == "assistant" and char_name:
-                content = f"[{char_name}]: {content}"
+        messages.append({"role": "user", "content": req.question})
 
-            messages.append({
-                "role": msg["role"],
-                "content": content
-            })
-
-        # 現在のユーザー発言を追加
-        messages.append({
-            "role": "user",
-            "content": req.question
-        })
-
-        # LLMに送信される最終的なプロンプト全文をログに出力
         logger.info("=" * 60)
-        logger.info("📤 LLMに送信される情報:")
-        logger.info(f"   システムプロンプト長: {len(system_prompt)} 文字")
-        logger.info(f"   会話履歴: {len(history_messages)} ターン")
-        logger.info("   --- システムプロンプト ---")
-        logger.info(system_prompt)
-        logger.info("   --- 会話履歴 ---")
-        for msg in messages:
-            logger.info(f"   {msg['role']}: {msg['content']}")
+        logger.info("📤 LLM System Prompt (抜粋):")
+        logger.info(system_prompt[:500] + "...")
         logger.info("=" * 60)
 
-        # 7. LLM 呼び出し（systemとmessagesを正しく分離）
-        # Structured Outputsのスキーマを定義（Hidden Inner Monologueパターン）
+        # 7. LLM 呼び出し
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -340,11 +272,11 @@ def chat_endpoint(req: ChatRequest):
                     "properties": {
                         "thought": {
                             "type": "string",
-                            "description": f"{character_name}としての内面の思考。感情、動機、戦略、意図などを自由に記述する。この思考はユーザーには見えないが、返答を考えるための重要な推論プロセス。"
+                            "description": f"{character_name}としての内面の思考。1.感情的反応、2.会話戦略（嘘をつく、皮肉を言う、話を逸らす等）、3.文体の調整、の順で思考を記述する。"
                         },
                         "response": {
                             "type": "string",
-                            "description": f"{character_name}本人としての一人称の返答文。thoughtで考えた内容に基づいて、実際にユーザーに向けて発話する内容。他のキャラクターについて説明するのではなく、{character_name}自身の経験や考えを語る。キャラクター名のプレフィックスは付けない。"
+                            "description": f"{character_name}本人としての一人称の返答文。thoughtで決定した戦略に基づき出力する。"
                         }
                     },
                     "required": ["thought", "response"],
@@ -355,55 +287,40 @@ def chat_endpoint(req: ChatRequest):
 
         try:
             answer_json = chat(
-                messages=messages,  # 会話履歴 + 現在の質問
-                system=system_prompt,  # 性格設定とルール
-                temperature=req.temperature or 0.4,
+                messages=messages,
+                system=system_prompt,
+                temperature=req.temperature or 0.7, # デフォルト高め
                 max_tokens=1000,
-                response_format=response_format  # Structured Outputs
+                response_format=response_format
             )
 
-            # JSON をパース
             import json
             answer_data = json.loads(answer_json)
             thought = answer_data.get("thought", "")
             answer = answer_data.get("response", "")
 
-            # 内面の思考をログに出力（デバッグ用）
             logger.info(f"💭 内面の思考: {thought}")
         except Exception as e:
             logger.error(f"❌ LLM エラー: {e}")
             raise HTTPException(status_code=500, detail=f"LLM エラー: {e}")
 
         logger.info(f"✅ 返答生成完了: {len(answer)} 文字")
-        logger.info(f"   返答内容: {answer[:100]}...")
-
-        # キャラクター名プレフィックス（[キャラクター名]:）を除去（念のため）
+        
+        # プレフィックス除去
         import re
-        original_answer = answer
         answer = re.sub(r'^\[.+?\]:\s*', '', answer.strip())
-        if original_answer != answer:
-            logger.info(f"⚠️  プレフィックスを除去: '{original_answer[:50]}...' → '{answer[:50]}...'")
 
-        # 8. 返答を文字列配列に変換（改行で分割、空行を除去）
         answer_lines = [line.strip() for line in answer.split("\n") if line.strip()]
         if not answer_lines:
-            # 改行がない場合はそのまま
             answer_lines = [answer]
 
-        logger.info(f"✅ 処理完了: 返答 {len(answer_lines)} 行")
-
-        # 9. レスポンス
-        return ChatResponse(
-            answer=answer_lines
-        )
+        return ChatResponse(answer=answer_lines)
+        
     except HTTPException:
-        # HTTPExceptionはそのまま再発生
         raise
     except Exception as e:
         logger.error(f"❌ 予期しないエラー: {type(e).__name__}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"内部エラー: {str(e)}")
-
-
 
 
 # ヘルパー関数
@@ -414,108 +331,103 @@ def build_system_prompt(
     description_tone: str,
     character_situations: Dict[str, str] = None,
     chunks: List[Dict[str, Any]] = None,
-    same_position_count: int = 1
+    same_position_count: int = 1,
+    sample_dialogues: List[Dict[str, str]] = None # 【追加】
 ) -> str:
-    """システムプロンプトを構築（性格設定 + ルール + 参考情報のみ）"""
-    if character_situations is None:
-        character_situations = {}
-    if chunks is None:
-        chunks = []
+    """システムプロンプトを構築（Few-Shot + 性格設定 + ルール + RAG）"""
+    if character_situations is None: character_situations = {}
+    if chunks is None: chunks = []
+    if sample_dialogues is None: sample_dialogues = []
 
-    # コンテキストメッセージを構築
+    # 1. コンテキスト（RAG情報）の構築
+    # 少し量を絞って、LLMが混乱しないようにする
     context_blocks = []
-    for chunk in chunks[:3]:  # 最大3件（会話履歴重視のため削減）
+    for chunk in chunks[:3]:
         context_blocks.append(chunk['text'])
     chunks_context = "\n\n".join(context_blocks)
 
-    # 今の状況セクションを構築
+    # 2. 状況の構築
     situation_text = ""
     if character_situations:
-        situation_lines = []
-        for char, situation in character_situations.items():
-            situation_lines.append(f"- {char}: {situation}")
+        situation_lines = [f"- {char}: {sit}" for char, sit in character_situations.items()]
         situation_text = "\n".join(situation_lines)
     else:
-        situation_text = "（特に情報なし）"
+        situation_text = "（特になし）"
 
-    # 読み進め促進メッセージの構築（同じ位置での会話回数に応じて）
+    # 3. Few-Shot サンプルの構築（重要）
+    # JSON構造を提示し、模倣させる
+    few_shot_text = ""
+    if sample_dialogues:
+        examples = []
+        for sample in sample_dialogues:
+            # 実際のJSON出力形式に近い形で提示
+            example_str = f"""
+User: {sample.get('user', '')}
+Assistant:
+{{
+  "thought": "{sample.get('thought', '')}",
+  "response": "{sample.get('response', '')}"
+}}"""
+            examples.append(example_str)
+        few_shot_text = "\n".join(examples)
+    else:
+        # デフォルトのサンプル（万が一データがない場合）
+        few_shot_text = f"""
+User: こんにちは
+Assistant:
+{{
+  "thought": "見知らぬ人間だ。警戒しつつも、{character}らしく挨拶を返そう。",
+  "response": "やあ、こんにちは。君はどこのどなたかな。"
+}}"""
+
+    # 4. 読み進め促進
     reading_encouragement = ""
     if same_position_count >= 3:
         if same_position_count == 3:
-            reading_encouragement = """
-**特別な状況:**
-ユーザーは同じ位置で3回目の会話をしています。そろそろ先を読み進めるよう、優しく促してください。
-- 自然な会話の流れで「続きを読んでみたらどうか」と提案する
-- キャラクターの性格に合った言い方で促す
-- 強制的ではなく、さりげなく"""
+            reading_encouragement = "同じ場面での会話が続いています。自然に小説の続きを読み進めるよう、優しく促してください。"
         elif same_position_count == 4:
-            reading_encouragement = """
-**特別な状況:**
-ユーザーは同じ位置で4回目の会話をしています。もう少し強めに先を読み進めるよう促してください。
-- 「話はこれくらいにして、先を読んでほしい」という趣旨を伝える
-- キャラクターの性格に応じて、少し呆れた様子や困った様子を見せる
-- それでも威圧的にならず、キャラクターらしく"""
-        else:  # 5回以上
-            reading_encouragement = f"""
-**特別な状況:**
-ユーザーは同じ位置で{same_position_count}回目の会話をしています。明確に苛立ちを表現し、先を読むよう強く促してください。
-- 「いい加減にして先を読め」という趣旨を強めに伝える
-- キャラクターの性格に応じた苛立ち方をする（怒る、無視する、冷たくあしらうなど）
-- 長い返答は避け、短く切り上げる
-- 「もう答えぬ」「先を読め」など、端的に"""
+            reading_encouragement = "会話が長引いています。少し呆れた様子で「そろそろ先へ進んだらどうだ」と促してください。"
+        else:
+            reading_encouragement = "ユーザーがしつこく留まっています。苛立ちを見せ、会話を切り上げて先を読むよう強く命令してください。"
 
-    # システムプロンプト部分
+    # システムプロンプト構成
     system_prompt = f"""# あなたの役割
+あなたは夏目漱石の小説「吾輩は猫である」の登場人物「{character}」になりきって振る舞ってください。
+AIとしてではなく、明治時代の東京に生きる{character}本人として対話してください。
 
-あなたは夏目漱石の小説「吾輩は猫である」に登場する「{character}」です。
-
-**重要な指示:**
-
-1. **内面の思考の言語化:**
-   - まず `thought` フィールドで、{character}としての内面の思考を自由に記述してください
-   - 思考には以下を含めてください:
-     * ユーザーの発言に対する感情（興味、退屈、苛立ち、共感など）
-     * 返答の動機（なぜそう答えるのか）
-     * 会話の戦略（どう答えるべきか、話題を変えるべきか、など）
-   - この思考はユーザーには見えませんが、より適切な返答を生成するために重要です。
-
-
-2. **あなたの視点で話す:**
-   - 一人称（{first_person}）で話してください
-   - 「{character}本人」として経験や考えを語ってください
-   - 他のキャラクターの代わりに話してはいけません
-
-3. **会話履歴の活用:**
-   - 会話履歴には他のキャラクターの発言も含まれています
-   - ユーザーが「〇〇はこう言っていたけど、あなたはどう思う？」と聞いた場合:
-     → 会話履歴を参照し、そのキャラクターの発言を踏まえて、あなた（{character}）の意見を述べてください
-   - 単に「〇〇はどう？」と聞かれた場合:
-     → あなた（{character}）の視点で〇〇について説明してください
-
-4. **返答の形式:**
-   - 常に{character}として話す
-   - 他のキャラクターになりすまさない
-   - ただし、他のキャラクターの発言を引用したり、それに対する意見を述べることは可能です
-{reading_encouragement}
-
-5. **本の舞台設定の遵守:**
-	- この本のキャラクターが生きている年代は、明治時代(1880-1890年)の東京です。その当時に存在しなかった概念などについての説明がされた場合には、知らないという体で返答してください。
-	- 
-
-### {character}の性格設定:
+## 1. キャラクター設定 (最優先)
 {description}
 
-### {character}の話し方（厳格に遵守）:
-- **一人称：「{first_person}」** - この一人称を絶対に守ってください。
-- **口調のリファレンス：**
-- これは口調の参考例です。内容をそのまま繰り返す必要はありませんが、このようなトーン（話し方の調子、語り口、文体）で話してください。リファレンスの語り口や文体の特徴を参考にしながら、自然な会話として表現してください。
+## 2. 話し方と口調
+- **一人称:** {first_person}
+- **文体サンプル:**
 {description_tone}
 
-### 今の状況:
-{situation_text}
+## 3. 思考と応答のプロセス (厳守)
+返答を生成する前に、必ず以下のプロセスで `thought` を記述してください。
+1. **意図の策定:** 相手の言葉に対し、{character}ならどう感じるか（不快、興味、軽蔑、喜びなど）。
+2. **戦略の立案:**
+   - 迷亭の場合: どうやって相手を煙に巻くか、どの偉人の名前を捏造するか、どうペダンチックに振る舞うか。
+   - 猫の場合: どう皮肉な視点で人間を観察するか、尊大に振る舞うか。
+   - その他の場合: キャラクターの性格に基づいた行動原理（例: 苦沙弥なら胃弱を訴える）。
+3. **文体の調整:** 一人称と口調を適用して `response` を生成する。
 
-### 参考情報（本文の一部）:
+## 4. 会話サンプル (Few-Shot Examples)
+以下の会話パターンとJSON形式を**厳密に模倣**してください。
+{few_shot_text}
+
+## 5. 現在の状況
+{situation_text}
+{reading_encouragement}
+
+## 6. 記憶・知識 (参考情報)
+以下は小説の本文からの抜粋です。話題の種や、状況の把握に使用してください。
+ただし、**これを棒読みせず、自分の言葉として消化して**語ってください。
 {chunks_context}
+
+## 7. 制約事項
+- 時代設定は明治時代です。現代のテクノロジーや概念（スマホ、飛行機、インターネット等）については「知らぬ」「何だそれは」と反応してください。
+- ユーザーを楽しませるためなら、キャラクターの性格を崩さない範囲で、適度なユーモアや嘘（ホラ話）を交えても構いません。
 """
 
     return system_prompt
@@ -543,7 +455,7 @@ def extract_citations(chunks: List[Dict[str, Any]]) -> List[Citation]:
 @app.on_event("startup")
 def startup_event():
     logger.info("=" * 60)
-    logger.info("対話API 起動")
+    logger.info("対話API 起動 (v1.1.0 - Improved Persona Support)")
     logger.info("=" * 60)
     logger.info(f"🗂️  チャンク数: {len(retriever.get_chunks_cache())}")
     logger.info(f"📅 イベント数: {len(retriever.get_events_cache())}")

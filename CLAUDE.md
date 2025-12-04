@@ -66,7 +66,7 @@ data/main.txt (input novel text)
     ↓
 [make_events.py] → data/events.jsonl
     ↓
-[make_persona_timeline.py] → data/character.jsonl
+[make_persona_timeline.py] → data/character.json
     ↓
 [make_special_rules.py] → data/special_rules.json
 ```
@@ -136,7 +136,7 @@ data/main.txt (input novel text)
    - `tempo`: Pacing (ゆっくり, 早口, etc.)
    - `quirks`: Catchphrases
 
-**Output schema** (`character.jsonl`):
+**Output schema** (`character.json`):
 
 ```json
 {

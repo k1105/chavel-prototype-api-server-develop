@@ -25,7 +25,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 CHUNKS_FILE = DATA_DIR / "chunks.jsonl"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
-PERSONA_FILE = DATA_DIR / "character.jsonl"
+PERSONA_FILE = DATA_DIR / "character.json"
 MAIN_TXT_FILE = DATA_DIR / "main.txt"
 
 # OpenAI クライアント
@@ -86,7 +86,10 @@ def load_chunks() -> List[Dict[str, Any]]:
     chunks = []
     with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            chunks.append(json.loads(line.strip()))
+            line = line.strip()
+            if not line:  # 空行をスキップ
+                continue
+            chunks.append(json.loads(line))
     chunks.sort(key=lambda x: x["scene_index"])
     return chunks
 
@@ -96,16 +99,19 @@ def load_events() -> List[Dict[str, Any]]:
     events = []
     with open(EVENTS_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            events.append(json.loads(line.strip()))
+            line = line.strip()
+            if not line:  # 空行をスキップ
+                continue
+            events.append(json.loads(line))
     return events
 
 
 def load_personas() -> Dict[str, Dict[str, Any]]:
-    """character.jsonl を読み込み、name でインデックス"""
+    """character.json を読み込み、name でインデックス"""
     personas = {}
     with open(PERSONA_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            persona = json.loads(line.strip())
+        data = json.load(f)  # JSON配列として読み込み
+        for persona in data:
             personas[persona["name"]] = persona
     return personas
 

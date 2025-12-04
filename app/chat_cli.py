@@ -83,7 +83,7 @@ def send_message(
     pos: int,
     session_id: str,
     k: int = 8,
-    temperature: float = 0.4
+    temperature: float = 0.7
 ) -> Optional[dict]:
     """API にメッセージを送信"""
     try:
