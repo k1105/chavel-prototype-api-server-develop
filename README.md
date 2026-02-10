@@ -194,9 +194,9 @@ python -m uvicorn app.dialog_api:app --host 0.0.0.0 --port 8000
 
 ### `POST /context`
 
-会話コンテクストを取得します。キャラクター選択時に呼び出し、初回メッセージと現在の読了位置における状況を取得します。
+会話コンテクストを取得します。キャラクター選択時に呼び出し、初回メッセージとシーン情報を即座に返します。
 
-`/chat` の前に呼び出すことで、状況要約（LLM 呼び出し結果）をサーバー側にキャッシュし、後続の `/chat` を高速化できます。ただし `/context` の呼び出しは必須ではなく、省略しても `/chat` は単独で動作します。
+状況要約（LLM 呼び出し）はバックグラウンドで非同期に開始されます。完了状況は `GET /context/status` でロングポーリングにより確認できます。`/chat` の前に呼び出すことで、状況要約をサーバー側にキャッシュし、後続の `/chat` を高速化できます。ただし `/context` の呼び出しは必須ではなく、省略しても `/chat` は単独で動作します。
 
 **リクエストボディ**:
 
@@ -219,22 +219,22 @@ python -m uvicorn app.dialog_api:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `character_name` | `string` | 解決されたキャラクター名 |
 | `first_message` | `string` | キャラクターの初回挨拶メッセージ |
-| `situation` | `string` | 現在の読了位置におけるキャラクターの状況要約（LLM 生成） |
 | `scene` | `object \| null` | 現在のシーン情報 |
 | `scene.scene_id` | `string` | シーンID（例: `"scene_00042"`） |
 | `scene.chapter` | `int` | 章番号 |
 | `scene.scene_index` | `int` | シーン通し番号 |
+| `context_ready` | `bool` | 状況要約の準備状況（常に `false`） |
 
 ```json
 {
   "character_name": "吾輩",
   "first_message": "吾輩は猫である。名前はまだ無い。……で、君は何者だ？",
-  "situation": "吾輩: 珍野苦沙弥の書斎の縁側で丸くなっている。...",
   "scene": {
     "scene_id": "scene_00042",
     "chapter": 3,
     "scene_index": 42
-  }
+  },
+  "context_ready": false
 }
 ```
 
@@ -243,7 +243,49 @@ python -m uvicorn app.dialog_api:app --host 0.0.0.0 --port 8000
 | ステータス | 条件 |
 |---|---|
 | `404` | `character_id` に対応するキャラクターが見つからない |
-| `500` | 内部エラー（LLM 呼び出し失敗等） |
+| `500` | 内部エラー |
+
+---
+
+### `GET /context/status`
+
+状況要約（LLM 処理）の完了をロングポーリングで待機します。LLM 処理が完了するまで HTTP レスポンスを返さず、完了した瞬間に `context_ready: true` を返します。タイムアウトした場合は `context_ready: false` を返します。
+
+**クエリパラメータ**:
+
+| パラメータ | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `character_id` | `int` | **必須** | キャラクターID |
+| `pos` | `int` | **必須** | 本文の現在位置（文字オフセット） |
+| `timeout` | `float` | - | 最大待機時間（秒）。デフォルト: `30`、最大: `60` |
+
+```
+GET /context/status?character_id=1&pos=1217&timeout=30
+```
+
+**レスポンス**:
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `context_ready` | `bool` | `true`: 状況要約の準備完了、`false`: タイムアウト |
+
+```json
+{
+  "context_ready": true
+}
+```
+
+**動作の詳細**:
+
+- 既にキャッシュ済みの場合 → 即座に `context_ready: true` を返す
+- バックグラウンド処理中の場合 → 完了まで待機し、完了時に `context_ready: true` を返す
+- タイムアウト経過しても未完了の場合 → `context_ready: false` を返す（フロント側でリトライ可能）
+
+**エラーレスポンス**:
+
+| ステータス | 条件 |
+|---|---|
+| `404` | `character_id` に対応するキャラクターが見つからない |
 
 ---
 
@@ -324,9 +366,13 @@ python -m uvicorn app.dialog_api:app --host 0.0.0.0 --port 8000
 ```
 ユーザーがキャラクターを選択
     │
-    ├─→ POST /context { character_id, pos }     ← fire-and-forget（完了を待たなくてよい）
+    ├─→ POST /context { character_id, pos }           ← 即座にレスポンス
     │     → first_message を画面に表示
-    │     → situation をサーバー側にキャッシュ
+    │     → context_ready: false（LLM処理はバックグラウンドで開始）
+    │
+    ├─→ GET /context/status?character_id=1&pos=...     ← ロングポーリングで完了を待機
+    │     → context_ready: true が返ったら準備完了を表示
+    │     → context_ready: false（タイムアウト）ならリトライ
     │
 ユーザーがメッセージを入力
     │

@@ -598,6 +598,35 @@ def retrieve_relevant_events(
     return relevant[:5]  # 最大5件
 
 
+def wait_situation_ready(pos: int, character_name: str, timeout: float = 30) -> bool:
+    """状況要約の完了をロングポーリングで待機する
+
+    Args:
+        pos: 現在の文字位置
+        character_name: キャラクター名
+        timeout: 最大待機時間（秒）
+
+    Returns:
+        True: キャッシュに結果あり、False: タイムアウト
+    """
+    cache_key = (pos, character_name)
+
+    # 既にキャッシュにあれば即座に true
+    if cache_key in _situation_cache:
+        return True
+
+    # ロック（Event）があれば、それを待つ
+    with _situation_locks_guard:
+        event = _situation_locks.get(cache_key)
+
+    if event is not None:
+        event.wait(timeout=timeout)
+        return cache_key in _situation_cache
+
+    # ロックもキャッシュもない = まだ処理が開始されていない or 既に完了している
+    return cache_key in _situation_cache
+
+
 def get_current_situation(
     pos: int,
     character_name: str,

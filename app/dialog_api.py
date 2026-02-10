@@ -6,9 +6,10 @@ FastAPI でキャラクターとの対話を提供
 
 import logging
 import json
+import threading
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -98,8 +99,12 @@ class SceneInfo(BaseModel):
 class ContextResponse(BaseModel):
     character_name: str
     first_message: str
-    situation: str
     scene: Optional[SceneInfo] = None
+    context_ready: bool
+
+
+class ContextStatusResponse(BaseModel):
+    context_ready: bool
 
 
 # エンドポイント
@@ -153,16 +158,20 @@ def context_endpoint(req: ContextRequest):
                 )
                 break
 
-        # 4. キャラクターの状況取得（LLM呼び出し、結果はキャッシュされる）
-        situation = retriever.get_current_situation(req.pos, character_name)
+        # 4. 状況取得をバックグラウンドで開始
+        threading.Thread(
+            target=retriever.get_current_situation,
+            args=(req.pos, character_name),
+            daemon=True
+        ).start()
 
-        logger.info(f"✅ コンテクスト取得完了: character={character_name}, scene={current_scene_index}")
+        logger.info(f"✅ コンテクスト取得完了（状況取得はバックグラウンド）: character={character_name}, scene={current_scene_index}")
 
         return ContextResponse(
             character_name=character_name,
             first_message=first_message,
-            situation=situation,
-            scene=scene_info
+            scene=scene_info,
+            context_ready=False
         )
 
     except HTTPException:
@@ -170,6 +179,24 @@ def context_endpoint(req: ContextRequest):
     except Exception as e:
         logger.error(f"❌ コンテクストエラー: {type(e).__name__}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"内部エラー: {str(e)}")
+
+
+@app.get("/context/status", response_model=ContextStatusResponse)
+def context_status_endpoint(
+    character_id: int = Query(..., description="キャラクターID"),
+    pos: int = Query(..., description="本文の現在位置（文字オフセット）"),
+    timeout: float = Query(default=30, ge=0, le=60, description="ロングポーリングのタイムアウト（秒）")
+):
+    """コンテクスト準備状況のロングポーリングエンドポイント"""
+    character_name = get_character_name_by_id(character_id)
+    if character_name is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"キャラクターID '{character_id}' が見つかりません"
+        )
+
+    ready = retriever.wait_situation_ready(pos, character_name, timeout=timeout)
+    return ContextStatusResponse(context_ready=ready)
 
 
 @app.post("/chat", response_model=ChatResponse)
