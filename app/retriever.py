@@ -6,6 +6,7 @@ pos 以前のチャンクのみを検索対象とし、ネタバレを防止
 
 import logging
 import re
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -21,6 +22,8 @@ COLLECTION_NAME = "neko_scenes"
 
 # 状況要約のキャッシュ（pos, character_name -> 要約テキスト）
 _situation_cache: Dict[Tuple[int, str], str] = {}
+_situation_locks: Dict[Tuple[int, str], threading.Event] = {}
+_situation_locks_guard = threading.Lock()
 
 
 def get_qdrant_client():
@@ -611,11 +614,32 @@ def get_current_situation(
     Returns:
         キャラクターの状況を要約したテキスト（常に何かしらの結果を返す）
     """
-    # キャッシュチェック
+    # キャッシュチェック（ロック付き：同一キーの並行LLM呼び出しを防止）
     cache_key = (pos, character_name)
     if cache_key in _situation_cache:
         logger.info(f"✓ {character_name}の状況要約をキャッシュから取得 (pos={pos})")
         return _situation_cache[cache_key]
+
+    with _situation_locks_guard:
+        # ダブルチェック：ガード取得中にキャッシュが埋まった場合
+        if cache_key in _situation_cache:
+            return _situation_cache[cache_key]
+        if cache_key in _situation_locks:
+            # 別スレッドが処理中 → 完了を待つ
+            event = _situation_locks[cache_key]
+        else:
+            # 自分が処理を担当する
+            event = threading.Event()
+            _situation_locks[cache_key] = event
+            event = None  # None = 自分が処理担当の印
+
+    if event is not None:
+        # 別スレッドの完了を待機
+        logger.info(f"⏳ {character_name}の状況要約を別リクエストが処理中、待機します (pos={pos})")
+        event.wait()
+        if cache_key in _situation_cache:
+            return _situation_cache[cache_key]
+        # 処理担当スレッドが失敗した場合、自分で再実行（下に続行）
 
     chunks = get_chunks_cache()
     current_scene = find_current_scene(pos)
@@ -728,3 +752,9 @@ def get_current_situation(
             default_msg = "現在位置付近の状況は不明"
             _situation_cache[cache_key] = default_msg
             return default_msg
+    finally:
+        # 待機中スレッドに完了を通知し、ロックを解放
+        with _situation_locks_guard:
+            ev = _situation_locks.pop(cache_key, None)
+        if ev is not None:
+            ev.set()

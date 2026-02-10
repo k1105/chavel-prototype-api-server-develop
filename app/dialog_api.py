@@ -83,11 +83,93 @@ class ChatResponse(BaseModel):
     answer: List[str]
 
 
+class ContextRequest(BaseModel):
+    book_id: Optional[str] = Field(None, description="書籍ID")
+    character_id: int = Field(..., description="キャラクターID")
+    pos: int = Field(..., description="本文の現在位置（文字オフセット）")
+
+
+class SceneInfo(BaseModel):
+    scene_id: str
+    chapter: int
+    scene_index: int
+
+
+class ContextResponse(BaseModel):
+    character_name: str
+    first_message: str
+    situation: str
+    scene: Optional[SceneInfo] = None
+
+
 # エンドポイント
 @app.get("/health")
 def health_check():
     """ヘルスチェック"""
     return {"ok": True}
+
+
+@app.post("/context", response_model=ContextResponse)
+def context_endpoint(req: ContextRequest):
+    """会話コンテクスト取得エンドポイント
+
+    キャラクター選択時に呼び出し、初回メッセージと現在の状況を取得する。
+    get_current_situation() の結果はキャッシュされるため、後続の /chat 呼び出しで再利用される。
+    """
+    try:
+        logger.info("=" * 60)
+        logger.info("📨 コンテクストリクエスト受信")
+        logger.info(f"   character_id={req.character_id}, pos={req.pos}")
+
+        # 1. キャラクター名を取得
+        character_name = get_character_name_by_id(req.character_id)
+        if character_name is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"キャラクターID '{req.character_id}' が見つかりません"
+            )
+
+        # 2. ペルソナ取得
+        personas = get_personas_cache()
+        if character_name not in personas:
+            raise HTTPException(
+                status_code=404,
+                detail=f"キャラクター '{character_name}' のペルソナが見つかりません"
+            )
+
+        persona = personas[character_name]
+        first_message = persona.get("first-message", "")
+
+        # 3. 現在のシーン情報
+        current_scene_index = retriever.find_current_scene(req.pos)
+        chunks = retriever.get_chunks_cache()
+        scene_info = None
+        for chunk in chunks:
+            if chunk["scene_index"] == current_scene_index:
+                scene_info = SceneInfo(
+                    scene_id=chunk["id"],
+                    chapter=chunk["chapter"],
+                    scene_index=chunk["scene_index"]
+                )
+                break
+
+        # 4. キャラクターの状況取得（LLM呼び出し、結果はキャッシュされる）
+        situation = retriever.get_current_situation(req.pos, character_name)
+
+        logger.info(f"✅ コンテクスト取得完了: character={character_name}, scene={current_scene_index}")
+
+        return ContextResponse(
+            character_name=character_name,
+            first_message=first_message,
+            situation=situation,
+            scene=scene_info
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ コンテクストエラー: {type(e).__name__}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部エラー: {str(e)}")
 
 
 @app.post("/chat", response_model=ChatResponse)
