@@ -12,18 +12,32 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from app.utils import get_chunks_cache, get_events_cache, embed, chat
+from app.utils import get_chunks_cache, get_events_cache, get_personas_cache, embed, chat
 
 logger = logging.getLogger(__name__)
 
 # Qdrant クライアント（オプショナル）
 _qdrant_client = None
-COLLECTION_NAME = "neko_scenes"
 
-# 状況要約のキャッシュ（pos, character_name -> 要約テキスト）
-_situation_cache: Dict[Tuple[int, str], str] = {}
-_situation_locks: Dict[Tuple[int, str], threading.Event] = {}
+
+def get_collection_name(lang: str = "ja") -> str:
+    """言語別の Qdrant コレクション名を返す"""
+    if lang == "ja":
+        return "neko_scenes"
+    return f"neko_scenes_{lang}"
+
+
+# 状況要約のキャッシュ（(lang, pos) -> 要約テキスト）
+_situation_cache: Dict[Tuple[str, int], str] = {}
+_situation_locks: Dict[Tuple[str, int], threading.Event] = {}
 _situation_locks_guard = threading.Lock()
+
+# character.json の名前 → chunks.jsonl での名前の揺れマッピング
+_CHARACTER_NAME_ALIASES: Dict[str, List[str]] = {
+    "おさん": ["御三"],
+    "二絃琴の師匠": ["二絃琴の御師匠さん"],
+    "珍野夫人": [],  # chunks.jsonl に登場しない
+}
 
 
 def get_qdrant_client():
@@ -42,9 +56,9 @@ def get_qdrant_client():
     return _qdrant_client if _qdrant_client is not False else None
 
 
-def find_current_scene(pos: int) -> Optional[int]:
+def find_current_scene(pos: int, lang: str = "ja") -> Optional[int]:
     """pos を含む/最も近いチャンクの scene_index を返す"""
-    chunks = get_chunks_cache()
+    chunks = get_chunks_cache(lang)
 
     # pos を含むチャンクを探す
     for chunk in chunks:
@@ -56,9 +70,9 @@ def find_current_scene(pos: int) -> Optional[int]:
     return closest["scene_index"]
 
 
-def retrieve_nearby(scene: int, window: int = 3) -> List[Dict[str, Any]]:
+def retrieve_nearby(scene: int, window: int = 3, lang: str = "ja") -> List[Dict[str, Any]]:
     """scene の前後 window のチャンクを取得"""
-    chunks = get_chunks_cache()
+    chunks = get_chunks_cache(lang)
 
     nearby = []
     for chunk in chunks:
@@ -71,18 +85,19 @@ def retrieve_nearby(scene: int, window: int = 3) -> List[Dict[str, Any]]:
 def search_semantic_qdrant(
     query_vec: List[float],
     k: int,
-    max_pos: int
+    max_pos: int,
+    lang: str = "ja"
 ) -> Optional[List[Dict[str, Any]]]:
     """Qdrant でベクトル検索（pos フィルタ付き）"""
     client = get_qdrant_client()
     if client is None:
         return None
 
+    collection_name = get_collection_name(lang)
+
     try:
         from qdrant_client.models import FieldCondition, Filter, Range
 
-        # max_pos を含むチャンク、または max_pos 以前で終わるチャンク
-        # start_pos <= max_pos のフィルタ（end_pos <= max_pos または start_pos <= max_pos <= end_pos）
         query_filter = Filter(
             must=[
                 FieldCondition(
@@ -93,7 +108,7 @@ def search_semantic_qdrant(
         )
 
         results = client.search(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             query_vector=query_vec,
             query_filter=query_filter,
             limit=k
@@ -112,7 +127,7 @@ def search_semantic_qdrant(
             }
             chunks.append(chunk_data)
 
-        logger.info(f"✓ Qdrant 検索: {len(chunks)} 件取得")
+        logger.info(f"✓ Qdrant 検索: {len(chunks)} 件取得 (collection={collection_name})")
         return chunks
 
     except Exception as e:
@@ -123,10 +138,11 @@ def search_semantic_qdrant(
 def search_semantic_fallback(
     query_vec: List[float],
     k: int,
-    max_pos: int
+    max_pos: int,
+    lang: str = "ja"
 ) -> List[Dict[str, Any]]:
     """フォールバック: ローカルでコサイン類似度検索"""
-    chunks = get_chunks_cache()
+    chunks = get_chunks_cache(lang)
 
     # max_pos を含むチャンク、または max_pos 以前で終わるチャンク
     candidates = [c for c in chunks if c["start_pos"] <= max_pos <= c["end_pos"] or c["end_pos"] <= max_pos]
@@ -169,19 +185,11 @@ def expand_query_with_history(
     question: str,
     history: List[Dict[str, str]] = None,
     character_name: str = None,
-    pos: int = None
+    pos: int = None,
+    lang: str = "ja"
 ) -> str:
     """
     会話履歴、キャラクター情報、テキスト位置を考慮して質問を拡張・リライト
-
-    Args:
-        question: 現在の質問
-        history: 会話履歴 [{"role": "user/assistant", "content": "..."}]
-        character_name: 対話相手のキャラクター名（例: "吾輩"）
-        pos: 現在のテキスト位置
-
-    Returns:
-        拡張された質問文
     """
     if not question or len(question.strip()) == 0:
         return question
@@ -196,11 +204,11 @@ def expand_query_with_history(
     for msg in recent_history:
         char_name = msg.get("character_name")
         if msg.get("role") == "user":
-            role_label = "ユーザー"
+            role_label = "User" if lang == "en" else "ユーザー"
         elif char_name:
-            role_label = char_name  # キャラクター名を使用
+            role_label = char_name
         else:
-            role_label = "キャラクター"
+            role_label = "Character" if lang == "en" else "キャラクター"
 
         content = msg.get("content", "")
         if content:
@@ -208,26 +216,42 @@ def expand_query_with_history(
 
     # キャラクター情報の取得
     from app.utils import get_personas_cache
-    personas = get_personas_cache()
+    personas = get_personas_cache(lang)
     character_info = ""
     if character_name and character_name in personas:
         persona = personas[character_name]
-        character_info = f"\n対話相手: {character_name}\n"
-        # キャラクターの関係性情報を追加
-        if character_name == "吾輩":
-            character_info += "（吾輩の家主は「苦沙弥先生」、嫌いな人物は「おさん」、友人に「車屋の黒」などがいる）"
+        character_info = f"\n{'Conversation partner' if lang == 'en' else '対話相手'}: {character_name}\n"
+        if lang == "ja":
+            if character_name == "吾輩":
+                character_info += "（吾輩の家主は「苦沙弥先生」、嫌いな人物は「おさん」、友人に「車屋の黒」などがいる）"
+        else:
+            if character_name == "the Cat":
+                character_info += "(The Cat's owner is 'Kushami', dislikes 'Osan', friends include 'Kuro')"
 
-    # 現在位置付近のテキストを取得（文脈のため）
+    # 現在位置付近のテキストを取得
     position_context = ""
     if pos is not None:
         from app.utils import get_text_around_position
-        nearby_text = get_text_around_position(pos, context_chars=100)
+        nearby_text = get_text_around_position(pos, context_chars=100, lang=lang)
         if nearby_text:
-            position_context = f"\n現在のテキスト位置付近: {nearby_text}\n"
+            label = "Current text position" if lang == "en" else "現在のテキスト位置付近"
+            position_context = f"\n{label}: {nearby_text}\n"
 
     # LLMを使って質問を拡張・リライト
     try:
-        system_prompt = """あなたは検索クエリを改善するアシスタントです。
+        if lang == "en":
+            system_prompt = """You are an assistant that improves search queries.
+Considering the conversation history, character info, and text position, rewrite the question for optimal novel text retrieval.
+
+Key tasks:
+1. **Resolve pronouns/omitted subjects**: e.g., "the owner" → "Mr. Kushami"
+2. **Specify time expressions**: e.g., "recently" → "near the current text position"
+3. **Resolve context references**: e.g., "What specifically?" → include the topic from conversation
+4. **Search-friendly format**: Use words from the novel text, concise (10-30 words)
+
+Output only the rewritten question."""
+        else:
+            system_prompt = """あなたは検索クエリを改善するアシスタントです。
 会話履歴、キャラクター情報、テキスト位置を考慮して、小説本文の検索に最適な質問文にリライトしてください。
 
 重要な処理：
@@ -250,29 +274,28 @@ def expand_query_with_history(
 
 出力は拡張された質問文のみを返してください。"""
 
-        user_message = f"""以下の情報をもとに、質問を検索に適した形にリライトしてください。
+        user_message = f"""{'Rewrite the following question for search:' if lang == 'en' else '以下の情報をもとに、質問を検索に適した形にリライトしてください。'}
 
 {character_info}
 {position_context}
-会話履歴:
-{history_context if history_context else "（なし）"}
+{'Conversation history' if lang == 'en' else '会話履歴'}:
+{history_context if history_context else ('(none)' if lang == 'en' else '（なし）')}
 
-現在の質問: {question}
+{'Current question' if lang == 'en' else '現在の質問'}: {question}
 
-リライトされた質問:"""
+{'Rewritten question' if lang == 'en' else 'リライトされた質問'}:"""
 
         expanded = chat(
             messages=[{"role": "user", "content": user_message}],
             system=system_prompt,
-            temperature=0.2,  # 0.3→0.2 より決定的に
+            temperature=0.2,
             max_tokens=150
         )
 
         expanded = expanded.strip()
-        # 引用符を除去
         expanded = expanded.strip('"').strip("'").strip("「").strip("」")
 
-        if expanded and len(expanded) > 5:  # 有効な結果の場合
+        if expanded and len(expanded) > 5:
             logger.info(f"📝 質問拡張: '{question}' → '{expanded}'")
             return expanded
         else:
@@ -286,55 +309,65 @@ def expand_query_with_history(
 def search_keyword(
     query: str,
     k: int,
-    max_pos: int
+    max_pos: int,
+    lang: str = "ja"
 ) -> List[Dict[str, Any]]:
     """
     キーワード検索（簡易版：テキスト内のキーワードマッチング）
-    
-    Args:
-        query: 検索クエリ
-        k: 取得件数
-        max_pos: 最大位置
-    
-    Returns:
-        検索結果チャンクのリスト
     """
-    chunks = get_chunks_cache()
-    
+    chunks = get_chunks_cache(lang)
+
     # max_pos以前のチャンクをフィルタ
     candidates = [c for c in chunks if c["start_pos"] <= max_pos]
-    
+
     if not candidates:
         return []
-    
-    # クエリからキーワードを抽出（日本語の単語境界を考慮）
+
+    # クエリからキーワードを抽出
     keywords = []
-    # 名詞や重要そうな単語を抽出（簡易版：2文字以上の連続文字）
-    words = re.findall(r'[一-龥ぁ-んァ-ン]{2,}', query)
-    keywords.extend(words)
-    
+    if lang == "en":
+        # 英語: 単語境界ベースの抽出（3文字以上の単語）
+        words = re.findall(r'\b\w{3,}\b', query.lower())
+        # ストップワードを除外
+        stop_words = {"the", "and", "for", "are", "but", "not", "you", "all",
+                      "can", "her", "was", "one", "our", "out", "has", "had",
+                      "his", "how", "its", "may", "who", "did", "get", "let",
+                      "say", "she", "too", "use", "what", "when", "where",
+                      "which", "this", "that", "with", "from", "have", "been",
+                      "will", "they", "were", "about", "would", "there", "their"}
+        keywords = [w for w in words if w not in stop_words]
+    else:
+        # 日本語: 2文字以上の連続文字
+        words = re.findall(r'[一-龥ぁ-んァ-ン]{2,}', query)
+        keywords.extend(words)
+
     # スコア計算（キーワードの出現回数）
     scored_chunks = []
     for chunk in candidates:
         text = chunk.get("text", "")
+        if lang == "en":
+            text_lower = text.lower()
         score = 0
         matched_keywords = []
-        
+
         for keyword in keywords:
-            count = text.count(keyword)
+            if lang == "en":
+                count = text_lower.count(keyword)
+            else:
+                count = text.count(keyword)
             if count > 0:
                 score += count
                 matched_keywords.append(keyword)
-        
+
         if score > 0:
             chunk_copy = chunk.copy()
             chunk_copy["score"] = float(score)
             chunk_copy["matched_keywords"] = matched_keywords
             scored_chunks.append(chunk_copy)
-    
+
     # スコアでソート
     scored_chunks.sort(key=lambda x: x["score"], reverse=True)
-    
+
     logger.info(f"🔍 キーワード検索: {len(scored_chunks)} 件 (キーワード: {keywords})")
     return scored_chunks[:k]
 
@@ -342,77 +375,80 @@ def search_keyword(
 def rerank_chunks(
     query: str,
     chunks: List[Dict[str, Any]],
-    top_k: int = None
+    top_k: int = None,
+    lang: str = "ja"
 ) -> List[Dict[str, Any]]:
-    """
-    LLMを使って検索結果を再ランキング
-    
-    Args:
-        query: 検索クエリ
-        chunks: 検索結果チャンク
-        top_k: 上位k件を返す（Noneの場合は全て）
-    
-    Returns:
-        再ランキングされたチャンクのリスト
-    """
+    """LLMを使って検索結果を再ランキング"""
     if not chunks or len(chunks) <= 1:
         return chunks
-    
+
     try:
-        # チャンクのテキストを準備
         chunk_texts = []
         for i, chunk in enumerate(chunks):
-            text = chunk.get("text", "")[:300]  # 先頭300文字
+            text = chunk.get("text", "")[:300]
             chunk_texts.append(f"[{i+1}] {text}")
-        
-        system_prompt = """あなたは検索結果をランキングするアシスタントです。
+
+        if lang == "en":
+            system_prompt = """You are a search result ranking assistant.
+Reorder the chunks by relevance to the search query (most relevant first).
+
+Focus on:
+- Chunks most related to the query intent go first
+- Less relevant chunks go last
+- Return only comma-separated numbers (e.g.: 3,1,2,4)"""
+        else:
+            system_prompt = """あなたは検索結果をランキングするアシスタントです。
 検索クエリに関連性が高い順に、チャンクの番号を並び替えてください。
 
 以下の点を重視してください：
 - 検索クエリの意図に最も関連するチャンクを上位に
 - 関連性の低いチャンクは下位に
 - 番号のみをカンマ区切りで返す（例: 3,1,2,4）"""
-        
-        user_message = f"""検索クエリ: {query}
+
+        if lang == "en":
+            user_message = f"""Search query: {query}
+
+Search results:
+{chr(10).join(chunk_texts)}
+
+Reorder the results by relevance. Return only comma-separated numbers (e.g.: 3,1,2,4)."""
+        else:
+            user_message = f"""検索クエリ: {query}
 
 検索結果:
 {chr(10).join(chunk_texts)}
 
 上記の検索結果を、検索クエリに関連性が高い順に並び替えてください。
 番号のみをカンマ区切りで返してください（例: 3,1,2,4）。"""
-        
+
         result = chat(
             messages=[{"role": "user", "content": user_message}],
             system=system_prompt,
             temperature=0.1,
             max_tokens=50
         )
-        
-        # 番号を抽出
+
         numbers = re.findall(r'\d+', result)
         if numbers:
             indices = [int(n) - 1 for n in numbers if 1 <= int(n) <= len(chunks)]
             if len(indices) == len(chunks):
-                # 重複除去して順序を保持
                 seen = set()
                 reranked = []
                 for idx in indices:
                     if idx not in seen:
                         seen.add(idx)
                         reranked.append(chunks[idx])
-                # 残りを追加
                 for i, chunk in enumerate(chunks):
                     if i not in seen:
                         reranked.append(chunk)
-                
+
                 logger.info(f"🔄 再ランキング: {len(reranked)} 件")
                 if top_k:
                     return reranked[:top_k]
                 return reranked
     except Exception as e:
         logger.warning(f"⚠️  再ランキングエラー: {e}")
-    
-    # エラー時は元の順序を返す
+
     if top_k:
         return chunks[:top_k]
     return chunks
@@ -427,92 +463,75 @@ def retrieve_chunks(
     character_name: str = None,
     use_query_expansion: bool = True,
     use_hybrid_search: bool = True,
-    use_reranking: bool = True
+    use_reranking: bool = True,
+    lang: str = "ja"
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     質問と位置に基づいてチャンクを取得（改善版）
-
-    Args:
-        question: 質問文
-        pos: 現在位置
-        k: 取得チャンク数
-        window: 近傍ウィンドウサイズ
-        history: 会話履歴 [{"role": "user/assistant", "content": "..."}]
-        character_name: 対話相手のキャラクター名
-        use_query_expansion: 質問拡張を使用するか
-        use_hybrid_search: ハイブリッド検索を使用するか
-        use_reranking: 再ランキングを使用するか
-
-    Returns:
-        (chunks, method): チャンクリストと使用した検索方法
     """
     # 現在のシーンを特定
-    current_scene = find_current_scene(pos)
+    current_scene = find_current_scene(pos, lang=lang)
     logger.info(f"📍 現在位置: pos={pos}, scene={current_scene}")
 
     # 近傍ウィンドウ取得
-    nearby = retrieve_nearby(current_scene, window=window)
+    nearby = retrieve_nearby(current_scene, window=window, lang=lang)
     logger.info(f"📦 近傍チャンク: {len(nearby)} 件")
 
-    # 質問の拡張・リライト（キャラクター情報とテキスト位置を考慮）
+    # 質問の拡張・リライト
     search_query = question
     if use_query_expansion:
         search_query = expand_query_with_history(
             question=question,
             history=history,
             character_name=character_name,
-            pos=pos
+            pos=pos,
+            lang=lang
         )
 
     logger.info(f"🔍 検索クエリ: '{search_query}'")
 
     # セマンティック検索
     query_vec = embed(search_query)
-    semantic_results = search_semantic_qdrant(query_vec, k=k*2, max_pos=pos)  # 多めに取得
+    semantic_results = search_semantic_qdrant(query_vec, k=k*2, max_pos=pos, lang=lang)
     method = "qdrant"
 
-    # Qdrant検索が失敗した、または結果が0件の場合はフォールバック
     if semantic_results is None or len(semantic_results) == 0:
         logger.info("⚠️  Qdrant検索結果が0件のため、フォールバック検索に切り替えます")
-        semantic_results = search_semantic_fallback(query_vec, k=k*2, max_pos=pos)
+        semantic_results = search_semantic_fallback(query_vec, k=k*2, max_pos=pos, lang=lang)
         method = "fallback"
 
-    # ハイブリッド検索：キーワード検索も実行
+    # ハイブリッド検索
     keyword_results = []
     if use_hybrid_search:
-        keyword_results = search_keyword(search_query, k=k, max_pos=pos)
+        keyword_results = search_keyword(search_query, k=k, max_pos=pos, lang=lang)
         logger.info(f"🔑 キーワード検索: {len(keyword_results)} 件")
 
     # 近傍 + セマンティック + キーワード結果を統合（重複除去）
     seen_scenes = set()
     combined = []
-    scene_to_chunk = {}  # シーンごとの最良チャンクを保持
+    scene_to_chunk = {}
 
-    # 近傍チャンクの類似度を計算（質問との関連度が高いものだけ追加）
+    # 近傍チャンクの類似度を計算
     nearby_with_scores = []
     for chunk in nearby:
         if chunk["start_pos"] <= pos <= chunk["end_pos"] or chunk["end_pos"] <= pos:
-            # 質問との類似度を計算
             chunk_text = chunk.get("text", "")
             chunk_vec = embed(chunk_text)
             similarity = cosine_similarity([query_vec], [chunk_vec])[0][0]
             chunk["nearby_similarity"] = similarity
             nearby_with_scores.append((chunk, similarity))
 
-    # 類似度でソートして、関連度の高い近傍チャンクのみ保持
     nearby_with_scores.sort(key=lambda x: x[1], reverse=True)
 
-    # 類似度が一定以上（0.7以上）、または上位2件のみ追加
     nearby_threshold = 0.7
     nearby_added = 0
     for i, (chunk, similarity) in enumerate(nearby_with_scores):
-        # 上位2件、または類似度0.7以上のチャンクのみ追加
         if i < 2 or similarity >= nearby_threshold:
             scene_idx = chunk["scene_index"]
             if scene_idx not in seen_scenes:
                 seen_scenes.add(scene_idx)
                 chunk["source"] = "nearby"
-                chunk["score"] = similarity + 0.2  # 近傍ボーナスを削減（0.5→0.2）
+                chunk["score"] = similarity + 0.2
                 scene_to_chunk[scene_idx] = chunk
                 nearby_added += 1
                 logger.info(f"   📌 近傍チャンク追加 (similarity={similarity:.3f}): scene={scene_idx}")
@@ -529,7 +548,6 @@ def retrieve_chunks(
             chunk["source"] = "semantic"
             scene_to_chunk[scene_idx] = chunk
         else:
-            # 既存のチャンクがある場合、スコアが高い方を保持
             existing = scene_to_chunk[scene_idx]
             if chunk.get("score", 0) > existing.get("score", 0):
                 chunk["source"] = "semantic"
@@ -543,19 +561,18 @@ def retrieve_chunks(
             chunk["source"] = "keyword"
             scene_to_chunk[scene_idx] = chunk
         else:
-            # 既存のチャンクがある場合、スコアを加算
             existing = scene_to_chunk[scene_idx]
             existing["score"] = existing.get("score", 0) + chunk.get("score", 0) * 0.3
             existing["source"] = existing.get("source", "") + "+keyword"
 
     combined = list(scene_to_chunk.values())
-    
+
     # スコアでソート
     combined.sort(key=lambda x: x.get("score", 0), reverse=True)
 
     # 再ランキング
     if use_reranking and len(combined) > 2:
-        combined = rerank_chunks(search_query, combined, top_k=k*2)
+        combined = rerank_chunks(search_query, combined, top_k=k*2, lang=lang)
 
     # 上位 k 件に制限
     combined = combined[:k]
@@ -566,19 +583,17 @@ def retrieve_chunks(
 
 def retrieve_relevant_events(
     current_scene: int,
-    chunks: List[Dict[str, Any]]
+    chunks: List[Dict[str, Any]],
+    lang: str = "ja"
 ) -> List[Dict[str, Any]]:
     """
     現在のシーンと取得したチャンクに関連するイベントを取得
-
-    pos より未来のイベントは除外
     """
-    events = get_events_cache()
+    events = get_events_cache(lang)
 
-    # 取得したチャンクの scene 範囲
     scene_indices = {c["scene_index"] for c in chunks}
     min_scene = min(scene_indices) if scene_indices else current_scene
-    max_scene = current_scene  # 現在位置まで
+    max_scene = current_scene
 
     relevant = []
     for event in events:
@@ -588,34 +603,21 @@ def retrieve_relevant_events(
         if first is None or last is None:
             continue
 
-        # イベントの範囲が max_scene 以前で、かつ取得範囲と重なる
         if last <= max_scene and first <= max_scene:
-            # 重なりチェック
             if first <= max_scene and last >= min_scene:
                 relevant.append(event)
 
     logger.info(f"📅 関連イベント: {len(relevant)} 件")
-    return relevant[:5]  # 最大5件
+    return relevant[:5]
 
 
-def wait_situation_ready(pos: int, character_name: str, timeout: float = 30) -> bool:
-    """状況要約の完了をロングポーリングで待機する
+def wait_situation_ready(pos: int, timeout: float = 30, lang: str = "ja") -> bool:
+    """状況要約の完了をロングポーリングで待機する"""
+    cache_key = (lang, pos)
 
-    Args:
-        pos: 現在の文字位置
-        character_name: キャラクター名
-        timeout: 最大待機時間（秒）
-
-    Returns:
-        True: キャッシュに結果あり、False: タイムアウト
-    """
-    cache_key = (pos, character_name)
-
-    # 既にキャッシュにあれば即座に true
     if cache_key in _situation_cache:
         return True
 
-    # ロック（Event）があれば、それを待つ
     with _situation_locks_guard:
         event = _situation_locks.get(cache_key)
 
@@ -623,167 +625,191 @@ def wait_situation_ready(pos: int, character_name: str, timeout: float = 30) -> 
         event.wait(timeout=timeout)
         return cache_key in _situation_cache
 
-    # ロックもキャッシュもない = まだ処理が開始されていない or 既に完了している
     return cache_key in _situation_cache
 
 
-def get_current_situation(
-    pos: int,
-    character_name: str,
-    window: int = 5
-) -> str:
+def get_scene_situation(pos: int, window: int = 3, lang: str = "ja") -> str:
     """
-    指定された位置付近で、指定されたキャラクターが何をしているかを取得し、要約して返す
-
-    Args:
-        pos: 現在の文字位置
-        character_name: キャラクター名
-        window: 検索する前後のシーン数
-
-    Returns:
-        キャラクターの状況を要約したテキスト（常に何かしらの結果を返す）
+    指定された位置付近の場面全体の状況を取得し、要約して返す
     """
-    # キャッシュチェック（ロック付き：同一キーの並行LLM呼び出しを防止）
-    cache_key = (pos, character_name)
+    cache_key = (lang, pos)
     if cache_key in _situation_cache:
-        logger.info(f"✓ {character_name}の状況要約をキャッシュから取得 (pos={pos})")
+        logger.info(f"✓ 状況要約をキャッシュから取得 (pos={pos}, lang={lang})")
         return _situation_cache[cache_key]
 
     with _situation_locks_guard:
-        # ダブルチェック：ガード取得中にキャッシュが埋まった場合
         if cache_key in _situation_cache:
             return _situation_cache[cache_key]
         if cache_key in _situation_locks:
-            # 別スレッドが処理中 → 完了を待つ
             event = _situation_locks[cache_key]
         else:
-            # 自分が処理を担当する
             event = threading.Event()
             _situation_locks[cache_key] = event
-            event = None  # None = 自分が処理担当の印
+            event = None
 
     if event is not None:
-        # 別スレッドの完了を待機
-        logger.info(f"⏳ {character_name}の状況要約を別リクエストが処理中、待機します (pos={pos})")
+        logger.info(f"⏳ 状況要約を別リクエストが処理中、待機します (pos={pos}, lang={lang})")
         event.wait()
         if cache_key in _situation_cache:
             return _situation_cache[cache_key]
-        # 処理担当スレッドが失敗した場合、自分で再実行（下に続行）
 
-    chunks = get_chunks_cache()
-    current_scene = find_current_scene(pos)
+    chunks = get_chunks_cache(lang)
+    current_scene = find_current_scene(pos, lang=lang)
 
-    # 現在位置付近のチャンクを取得（pos以前のみ）
     nearby_chunks = []
     for chunk in chunks:
-        # posを含むチャンク、またはpos以前で終わるチャンク
         if (chunk["start_pos"] <= pos <= chunk["end_pos"] or chunk["end_pos"] <= pos):
-            # 現在シーンの前後window内
             if abs(chunk["scene_index"] - current_scene) <= window:
-                # 指定されたキャラクターが登場しているチャンク
-                if character_name in chunk.get("characters", []):
-                    nearby_chunks.append(chunk)
+                nearby_chunks.append(chunk)
 
-    # チャンクが見つからない場合、windowを広げて再検索
-    if not nearby_chunks:
-        logger.info(f"⚠️  {character_name}の近傍チャンクが見つからないため、windowを拡大して再検索")
-        expanded_window = window * 2
-        for chunk in chunks:
-            if (chunk["start_pos"] <= pos <= chunk["end_pos"] or chunk["end_pos"] <= pos):
-                if abs(chunk["scene_index"] - current_scene) <= expanded_window:
-                    if character_name in chunk.get("characters", []):
-                        nearby_chunks.append(chunk)
-
-    # それでも見つからない場合、現在位置付近のチャンクを取得（キャラクター指定なし）
-    if not nearby_chunks:
-        logger.info(f"⚠️  {character_name}のチャンクが見つからないため、現在位置付近のチャンクを使用")
-        for chunk in chunks:
-            if (chunk["start_pos"] <= pos <= chunk["end_pos"] or chunk["end_pos"] <= pos):
-                if abs(chunk["scene_index"] - current_scene) <= window:
-                    nearby_chunks.append(chunk)
-
-    # 最も近いチャンク（posに最も近い）を優先してソート
     nearby_chunks.sort(key=lambda c: abs(c["start_pos"] - pos))
 
-    # 最大3つのチャンクのテキストを集める（近いものから）
+    scene_characters = set()
+    for chunk in nearby_chunks[:3]:
+        for char in chunk.get("characters", []):
+            scene_characters.add(char)
+
     relevant_texts = []
     for chunk in nearby_chunks[:3]:
         text = chunk.get("text", "").strip()
         if text:
             relevant_texts.append(text)
 
-    # テキストが見つからない場合でも、現在位置付近のテキストを取得
     if not relevant_texts:
-        logger.warning(f"⚠️  {character_name}の関連テキストが見つかりません。現在位置付近のテキストを使用")
-        # 現在位置を含むチャンクを探す
+        logger.warning(f"⚠️  関連テキストが見つかりません。現在位置付近のテキストを使用 (pos={pos})")
         for chunk in chunks:
             if chunk["start_pos"] <= pos <= chunk["end_pos"]:
                 text = chunk.get("text", "").strip()
                 if text:
-                    relevant_texts.append(text[:500])  # 先頭500文字
+                    relevant_texts.append(text[:500])
+                    for char in chunk.get("characters", []):
+                        scene_characters.add(char)
                     break
 
-    # チャンクテキストを結合
     combined_text = "\n\n".join(relevant_texts) if relevant_texts else ""
 
-    # 要約プロンプトを作成（特定のキャラクターを指定せず、純粋に現在の状況を要約）
-    system_prompt = """あなたは小説のテキストを分析するアシスタントです。
-テキスト近傍で何が起こっているのかを整理し、登場している人物ごとに、誰が何をしているのかを説明してください。
+    if lang == "en":
+        characters_str = ", ".join(sorted(scene_characters)) if scene_characters else "(unknown)"
 
-以下の点を重視してください：
-- テキスト近傍で何が起こっているのかを整理する（場面の状況、出来事の流れなど）
-- 登場している人物を特定し、それぞれの人物が何をしているのか、どのような行動を取っているのかを具体的に説明する
-- 各人物の状況や心理状態も含めて説明する
-- 人物ごとに分けて説明する（例：「人物A: ...」「人物B: ...」のような形式）
-- 簡潔すぎず、必要な情報を含めて説明する（100-200文字程度を目安）"""
+        system_prompt = """You are an assistant that summarizes scenes from a novel concisely.
 
-    user_message = f"""以下のテキストから、テキスト近傍で何が起こっているのかを整理し、登場している人物ごとに、誰が何をしているのかを説明してください。
+Read the text and output in the following format:
 
+[Scene] (location, time of day, situation in one sentence)
+- Character name: What they are doing, their state (1-2 sentences)
+
+Rules:
+- The [Scene] line should be under 80 characters, stating location and situation briefly
+- Only describe characters that appear in the character list
+- Keep each character's description concise (1-2 sentences), including actions and mental state
+- Do not infer information not explicitly in the text"""
+
+        user_message = f"""Summarize the following scene from the novel "I Am a Cat" (Natsume Sōseki).
+
+Characters: {characters_str}
+
+Text:
+{combined_text}"""
+    else:
+        characters_str = "、".join(sorted(scene_characters)) if scene_characters else "（不明）"
+
+        system_prompt = """あなたは小説の場面を簡潔に整理するアシスタントです。
+
+テキストを読み、以下の形式で出力してください：
+
+【場面】（場所・時間帯・状況を1文で）
+- 人物名: その人物が何をしているか、どのような状態か（1-2文）
+
+ルール：
+- 「【場面】」行は50文字以内で、場所と状況を端的に述べる
+- 登場人物リストに含まれる人物のみ記述する
+- 各人物の説明は簡潔に（各30-60文字）、行動と心理状態を含める
+- テキストに明示されていない情報は推測しない"""
+
+        user_message = f"""以下のテキスト（小説「吾輩は猫である」の一部）から、場面を整理してください。
+
+登場人物: {characters_str}
+
+テキスト:
 {combined_text}"""
 
-    # 要約に使用されるプロンプト全文をログに出力
     logger.info("=" * 60)
-    logger.info(f"📝 {character_name}の状況要約プロンプト全文:")
-    logger.info(f"   システムプロンプト:")
-    logger.info(f"   {system_prompt}")
-    logger.info(f"   ユーザーメッセージ:")
-    logger.info(f"   {user_message}")
+    logger.info(f"📝 状況要約プロンプト (pos={pos}, lang={lang}):")
+    logger.info(f"   登場人物: {characters_str}")
+    logger.info(f"   テキスト長: {len(combined_text)} 文字")
     logger.info("=" * 60)
 
     try:
-        # 軽量なモデルで要約（gpt-4o-miniを使用、max_tokensを増やして詳細な説明を可能にする）
         summary = chat(
             messages=[{"role": "user", "content": user_message}],
             system=system_prompt,
-            temperature=0.3,
-            max_tokens=300
+            temperature=0.2,
+            max_tokens=400
         )
         result = summary.strip()
         if not result:
-            result = "現在位置付近の状況は不明"
-        logger.info(f"✓ {character_name}の状況要約結果: {result[:50]}...")
+            result = "The situation near the current position is unknown" if lang == "en" else "現在位置付近の状況は不明"
+        logger.info(f"✓ 状況要約結果 (pos={pos}): {result[:80]}...")
 
-        # キャッシュに保存
         _situation_cache[cache_key] = result
         return result
     except Exception as e:
-        logger.error(f"❌ 要約エラー ({character_name}): {e}")
-        # エラー時はフォールバック：最初のチャンクの一部を返す
+        logger.error(f"❌ 要約エラー (pos={pos}): {e}")
         if relevant_texts:
             fallback_text = relevant_texts[0]
             if len(fallback_text) > 200:
                 fallback_text = fallback_text[:200] + "..."
-            # フォールバック結果もキャッシュに保存
             _situation_cache[cache_key] = fallback_text
             return fallback_text
         else:
-            # それでも見つからない場合は、デフォルトメッセージを返す
-            default_msg = "現在位置付近の状況は不明"
+            default_msg = "The situation near the current position is unknown" if lang == "en" else "現在位置付近の状況は不明"
             _situation_cache[cache_key] = default_msg
             return default_msg
     finally:
-        # 待機中スレッドに完了を通知し、ロックを解放
         with _situation_locks_guard:
             ev = _situation_locks.pop(cache_key, None)
         if ev is not None:
             ev.set()
+
+
+def get_appeared_characters(pos: int, lang: str = "ja") -> List[Dict[str, Any]]:
+    """
+    pos以前に登場済みの character.json 登録キャラクターをリストアップする
+    """
+    chunks = get_chunks_cache(lang)
+    personas = get_personas_cache(lang)
+
+    # character.json の名前 → チャンク内での名前（逆引き）を構築
+    chunk_name_to_persona_name: Dict[str, str] = {}
+    for persona_name in personas:
+        chunk_name_to_persona_name[persona_name] = persona_name
+        for alias in _CHARACTER_NAME_ALIASES.get(persona_name, []):
+            chunk_name_to_persona_name[alias] = persona_name
+
+    # pos以前の全チャンクから characters をunion集合
+    appeared_chunk_names: set = set()
+    for chunk in chunks:
+        if chunk["end_pos"] <= pos or (chunk["start_pos"] <= pos <= chunk["end_pos"]):
+            for char in chunk.get("characters", []):
+                appeared_chunk_names.add(char)
+
+    # character.json に登録されている名前のみフィルタ
+    appeared_persona_names: set = set()
+    for chunk_name in appeared_chunk_names:
+        persona_name = chunk_name_to_persona_name.get(chunk_name)
+        if persona_name:
+            appeared_persona_names.add(persona_name)
+
+    # 結果を構築（id順にソート）
+    result = []
+    for persona_name in appeared_persona_names:
+        persona = personas[persona_name]
+        result.append({
+            "id": persona["id"],
+            "name": persona["name"],
+            "first_message": persona.get("first-message", ""),
+        })
+
+    result.sort(key=lambda x: x["id"])
+    logger.info(f"📋 登場済みキャラクター (pos={pos}, lang={lang}): {[c['name'] for c in result]}")
+    return result

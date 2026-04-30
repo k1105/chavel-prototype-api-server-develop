@@ -1,0 +1,95 @@
+About seven minutes later, Kangetsu-kun arrived as expected. Since he was to give a lecture that evening, he was unusually well-dressed in a splendid frock coat and a stiff, freshly laundered collar; he looked about twenty percent more handsome than usual as he greeted us with total composure, saying, "I'm a bit late."
+
+"The two of us have been waiting most impatiently. Let's have it at once, shall we, my friend?" Meitei said, looking at the master. The master gave an obligatory, non-committal "Mmm."
+
+Kangetsu-kun was in no hurry. "I'll have a glass of water first," he said.
+
+"Oho! Doing it properly, are we? I suppose a request for applause will come next," Meitei made a fuss all by himself. Kangetsu-kun took the manuscript from his inner pocket and, with the preamble, "This is just a rehearsal, so please critique it without reservation," he finally began his practice session.
+
+"The execution of criminals by hanging was a method primarily employed among the Anglo-Saxon peoples. If we look further back into antiquity, hanging was mainly used as a means of suicide. Among the Jews, it seems the custom was to kill criminals by pelting them with stones. If one studies the Old Testament, the term 'hanging' is understood to mean the suspension of a criminal's corpse to serve as food for wild beasts or birds of prey. According to the accounts of Herodotus, it appears the Jews, even before leaving Egypt, had a deep-seated loathing of having their corpses exposed during the night. The Egyptians, it is said, would decapitate criminals and nail only their torsos to a cross to be exposed at night. The Persians..."
+
+"Kangetsu-kun, your connection to the actual act of hanging seems to be getting rather distant. Are you sure you're all right?" Meitei interjected.
+
+"I am just about to enter the main argument, so please be patient. ...Now, as for the Persians, it seems they also used crucifixion for executions. However, whether they were crucified while alive or nailed up after death is somewhat difficult to determine..."
+
+"It doesn't matter either way," the master said, giving a bored yawn.
+
+"There are many other things I'd like to tell you, but I suppose it might be a nuis-ahnce..."
+
+"It’s better to say 'nuisance' than 'nuis-ahnce,' don't you think, Kushami-kun?" Meitei chided him again. The master gave a listless reply: "It’s the same either way."
+
+"Now then, I shall proceed to discourse on the main subject."
+
+"'Discourse' is the sort of thing a professional storyteller says. I’d like a lecturer to use more refined language," Meitei interjected once more.
+
+"If 'discourse' is vulgar, what should I say?" Kangetsu-kun asked, sounding a bit huffy.
+
+"I can't tell if Meitei is listening or just trying to mess with you. Don't mind that meddler, Kangetsu-kun, just get on with it," the master said, wanting to get through the ordeal as quickly as possible.
+
+"A huffy discourse, / Like a willow in the wind / Is it not?" Meitei quipped airily as always. Kangetsu couldn't help but chuckle.
+
+"The use of hanging truly as a method of execution is found, according to my research, in the twenty-second book of the Odyssey. That is, the passage where Telemachus hangs the twelve handmaidens of Penelope. I could read the original text in Greek, but since that might seem a bit pedantic, I shall refrain. You will find it if you look at lines 465 to 473."
+
+"You'd better drop the bit about the Greek; it sounds as if you're trying to show off that you can read it, doesn't it, Kushami-kun?"
+
+"I agree. It’s more dignified to refrain from such ostentatious displays," the master said, siding with Meitei immediately for once. Neither of them can read a word of Greek.
+
+"In that case, I shall omit those few lines tonight and proceed to ex-p-pound—that is, to state the following.
+
+When we imagine this act of hanging now, there are two methods by which it could be executed. The first is that Telemachus, with the help of Eumaeus and Philoetius, tied one end of a rope to a pillar. Then, having made several loops in the rope, he placed the heads of the women into these holes one by one and pulled the other end of the rope taut to hoist them up.
+
+"In short, we should imagine the women dangling like shirts at a Western laundry, I suppose?"
+
+"Exactly. And the second method is to tie one end of the rope to a pillar as before, while the other end is tied high to the ceiling from the start. Then, several other ropes are dropped from that high rope, each with a noose at the end for the women's necks; the 'plan' being to remove the footstools from under the women at the critical moment."
+
+"To put it in a metaphor, it would be like the sight of lantern bulbs hanging from the end of a rope curtain."
+
+"I haven't seen any bulbs for lanterns, so I can't say, but if such things exist, I suppose that would be the idea. —Now, I shall demonstrate that, from a mechanical perspective, the first case is utterly impossible to achieve."
+
+"Interesting," said Meitei. "Yes, interesting," the master agreed.
+
+"First, we assume that the women are suspended at equal distances. We also assume that the rope connecting the necks of the two women closest to the ground is horizontal. Let $\alpha_1, \alpha_2, \dots, \alpha_6$ be the angles the rope makes with the horizontal, and let $T_1, T_2, \dots, T_6$ be the forces acting on each section of the rope, with $T_7 = X$ being the force at the lowest part of the rope. $W$, of course, is the weight of each woman. Do you follow me so far?"
+
+Meitei and the master looked at each other and said, "More or less." However, since this "more or less" was a measure they had devised themselves, it might not be applicable to others.
+
+"Now, according to the well-known theory of equilibrium concerning polygons, we can establish twelve equations as follows:
+
+
+$$T_1 \cos \alpha_1 = T_2 \cos \alpha_2 \dots (1)$$
+
+$$T_2 \cos \alpha_2 = T_3 \cos \alpha_3 \dots (2)$$
+
+
+..."
+
+"That's quite enough equations," the master said rudely.
+
+"But these equations are the heart of the lecture," Kangetsu-kun said, looking very reluctant to let them go.
+
+"Well then, why don't we hear the heart of the matter some other time?" Meitei said, appearing a bit overwhelmed himself.
+
+"If I omit these equations, all my mechanical research will go to waste..."
+
+"Oh, don't worry about that; just skip them, skip them!" the master said unconcernedly.
+
+"Then, as you wish, though it's a bit irregular, I shall skip them."
+
+"That's better," Meitei said, clapping his hands at an odd moment.
+
+"Moving on to England, the word 'galga,' meaning a gallows, appears in Beowulf, so it seems certain that execution by hanging was practiced from that era. According to Blackstone, if a criminal sentenced to death by hanging fails to die due to some mishap with the rope, the execution should be carried out a second time. Curiously, however, there is a line in Piers Plowman stating that even for a villain, there is no law to hang them twice. I don't know which is true, but there are indeed cases where one fails to die on the first attempt. In 1786, a famous rogue named Fitzgerald was being hanged. By a strange fluke, the first time he jumped from the platform, the rope broke. They tried again, but this time the rope was too long and his feet touched the ground, so he still didn't die. Finally, on the third attempt, the spectators helped out and finished him off."
+
+"Good heavens!" Meitei said, suddenly becoming energetic at this part of the story.
+
+"Talk about a failure to die," even the master was getting excited.
+
+"There’s more of interest: they say that if you hang yourself, you grow about an inch taller. This was actually measured by a doctor, so there's no mistake."
+
+"That’s a new idea! What do you say, Kushami? Perhaps you should have yourself hung for a bit; if you grew an inch, you might finally become a man of average height," Meitei said, turning to the master. The master, unexpectedly serious, asked:
+
+"Kangetsu-kun, is it possible to grow an inch and then come back to life?"
+
+"That’s quite out of the question. It’s because the spinal cord is stretched, or rather, it’s more accurate to say it breaks rather than grows."
+
+"In that case, I think I'll pass," the master said, abandoning the idea.
+
+The rest of the lecture was still quite long, as Kangetsu-kun intended to discuss the physiological effects of hanging, but since Meitei kept interjecting with strange, nonsensical remarks and the master frequently yawned without reservation, he finally gave up midway and went home. What sort of attitude Kangetsu-kun adopted and what kind of eloquence he displayed that evening, I have no way of knowing, as it was an event that took place far away.

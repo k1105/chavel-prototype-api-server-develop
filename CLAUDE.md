@@ -10,6 +10,7 @@ This is a Japanese literary text processing pipeline that analyzes "吾輩は猫
 2. **Event extraction** using LLM (Map-Reduce pattern with embedding-based clustering)
 3. **Character persona timeline** generation across story progression
 4. **Special rules** generation for banned phrases and style overrides
+5. **Bilingual support** (Japanese + English) via `lang` parameter
 
 All scripts are independent and run sequentially to produce JSONL/JSON data files.
 
@@ -28,23 +29,19 @@ pip install -r requirements.txt
 
 ### Data Pipeline Execution
 
-The scripts must be run in this order:
+Data is organized by language under `data/{lang}/`:
 
 ```bash
-# 1. Generate chunks from main.txt (600-1400 chars each)
-python app/make_chunks.py
+# Japanese (default)
+python app/make_chunks.py                    # → data/ja/chunks.jsonl
+python app/make_chunks.py --llm-ner          # With LLM-assisted character detection
+python app/index_chunks_qdrant.py            # → Qdrant "neko_scenes" collection
 
-# With LLM-assisted character detection:
-python app/make_chunks.py --llm-ner --llm-ner-limit 100 --ner-min-heuristic 2
-
-# 2. Extract events from chunks using Map-Reduce
-python app/make_events.py
-
-# 3. Generate character persona timelines
-python app/make_persona_timeline.py
-
-# 4. Create special rules (banned phrases, fixed replies, style overrides)
-python app/make_special_rules.py
+# English
+python app/translate_text.py --chapters 3    # → data/en/main.txt (translate first 3 chapters)
+python app/translate_characters.py           # → data/en/character.json + data/en/events.jsonl
+python app/make_chunks.py --lang en          # → data/en/chunks.jsonl
+python app/index_chunks_qdrant.py --lang en  # → Qdrant "neko_scenes_en" collection
 ```
 
 ### Environment Variables
@@ -57,18 +54,52 @@ Set in `.env` file:
 
 ## Architecture
 
+### Data Directory Structure
+
+```
+data/
+  ja/                          # Japanese data
+    main.txt                   # Source novel text
+    chunks.jsonl               # Processed chunks
+    events.jsonl               # Extracted events
+    character.json             # Character personas
+    special_rules.json         # Conversation guard rails
+    ner_cache.json             # NER cache (auto-generated)
+  en/                          # English data
+    main.txt                   # Translated novel text
+    chunks.jsonl               # Processed chunks (English)
+    events.jsonl               # Translated events
+    character.json             # Translated character personas
+    special_rules.json         # English conversation rules
+    ner_cache.json             # NER cache (auto-generated)
+  wagahai.json                 # Alternative source data (shared)
+```
+
+### API Endpoints
+
+All endpoints accept a `lang` parameter (`"ja"` default, `"en"` for English):
+
+```
+POST /context  { "pos": 1217, "lang": "en" }
+GET  /context/status?pos=1217&lang=en
+POST /chat     { "pos": 1217, "question": "...", "lang": "en", ... }
+```
+
+### Qdrant Collections
+
+- Japanese: `neko_scenes` (existing)
+- English: `neko_scenes_en`
+
 ### Data Flow
 
 ```
-data/main.txt (input novel text)
+data/{lang}/main.txt (input novel text)
     ↓
-[make_chunks.py] → data/chunks.jsonl + data/ner_cache.json
+[make_chunks.py --lang {lang}] → data/{lang}/chunks.jsonl + ner_cache.json
     ↓
-[make_events.py] → data/events.jsonl
+[index_chunks_qdrant.py --lang {lang}] → Qdrant collection
     ↓
-[make_persona_timeline.py] → data/character.json
-    ↓
-[make_special_rules.py] → data/special_rules.json
+dialog_api.py + retriever.py (read-only, lang parameter selects data)
 ```
 
 ### make_chunks.py
@@ -77,12 +108,14 @@ data/main.txt (input novel text)
 
 **Key features**:
 
-- Chapter detection via regex (`第X章`)
-- Sentence-based packing (target: 1000 chars, min: 600, max: 1400)
+- Chapter detection via regex (`第X章` for Japanese, `Chapter N` for English)
+- Sentence-based packing:
+  - Japanese: target 1000, min 600, max 1400 chars
+  - English: target 2000, min 1200, max 2800 chars
 - Two-stage character detection:
-  1. Rule-based: Uses `ALLOWED_NAMES` (64 canonical characters) + `ALIASES` dictionary for variant spellings
+  1. Rule-based: Uses `ALLOWED_NAMES`/`ALLOWED_NAMES_EN` + `ALIASES`/`ALIASES_EN`
   2. Optional LLM fallback: When heuristic detection finds < `ner_min_heuristic` characters
-- Caching: `ner_cache.json` stores LLM results by scene_id
+- `--lang` argument selects language-specific names, paths, and sentence splitting
 
 **Output schema** (`chunks.jsonl`):
 
@@ -162,14 +195,23 @@ data/main.txt (input novel text)
 2. **fixed_replies**: Regex-based canned responses (e.g., gratitude → "礼には及ばない")
 3. **style_overrides**: Context-based style adjustments (e.g., "！" → stronger tone)
 
-**Output**: `data/special_rules.json`
+**Output**: `data/{lang}/special_rules.json`
 
 ## Key Design Patterns
+
+### Bilingual Support
+
+- All API endpoints accept `lang` parameter (default: `"ja"`)
+- Data loading functions in `utils.py` take `lang` parameter
+- Caches are language-keyed dictionaries: `Dict[str, ...]`
+- Qdrant collection names: `neko_scenes` (ja), `neko_scenes_en` (en)
+- LLM prompts in `retriever.py` switch language based on `lang`
+- `build_system_prompt()` in `dialog_api.py` generates full English prompts when `lang="en"`
 
 ### Character Detection Strategy
 
 - **Allowlist-first**: Only canonical names in `ALLOWED_NAMES` can appear
-- **Fuzzy matching**: Uses word boundary regex tailored for Japanese text
+- **Fuzzy matching**: Uses word boundary regex tailored for Japanese/English text
 - **LLM as fallback**: Avoids hallucination by constraining to allowlist
 - **Caching**: Prevents redundant API calls across reruns
 
@@ -189,10 +231,9 @@ data/main.txt (input novel text)
 
 ### make_chunks.py
 
-- `TARGET_CHUNK = 1000`: Ideal chunk size in characters
-- `MIN_CHUNK = 600`: Minimum before merging with next
-- `MAX_CHUNK = 1400`: Hard limit before forced split
-- Character limit per chunk: 8 (line 337)
+- Japanese: `TARGET_CHUNK = 1000`, `MIN_CHUNK = 600`, `MAX_CHUNK = 1400`
+- English: `TARGET_CHUNK_EN = 2000`, `MIN_CHUNK_EN = 1200`, `MAX_CHUNK_EN = 2800`
+- Character limit per chunk: 8
 
 ### make_events.py
 

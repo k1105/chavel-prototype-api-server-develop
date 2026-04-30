@@ -2,9 +2,10 @@
 """
 Qdrant インデックス作成スクリプト
 
-data/chunks.jsonl を読み込み、Qdrant にベクトルインデックスを構築します。
+data/{lang}/chunks.jsonl を読み込み、Qdrant にベクトルインデックスを構築します。
 """
 
+import argparse
 import json
 import os
 import time
@@ -24,12 +25,18 @@ load_dotenv(env_path)
 # 設定
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_NAME = "neko_scenes"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 BATCH_SIZE = 100
 
 # データファイルパス
-CHUNKS_FILE = Path(__file__).resolve().parents[1] / "data" / "chunks.jsonl"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+
+
+def get_collection_name(lang: str = "ja") -> str:
+    """言語別の Qdrant コレクション名を返す"""
+    if lang == "ja":
+        return "neko_scenes"
+    return f"neko_scenes_{lang}"
 
 
 def get_embedding_dimension(client: OpenAI, model: str) -> int:
@@ -168,8 +175,16 @@ def print_statistics(chunks: List[Dict[str, Any]]):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Qdrant インデックス作成")
+    parser.add_argument("--lang", type=str, default="ja", help="Language: 'ja' or 'en'")
+    args = parser.parse_args()
+
+    lang = args.lang
+    collection_name = get_collection_name(lang)
+    chunks_file = DATA_DIR / lang / "chunks.jsonl"
+
     print("=" * 60)
-    print("🐱 吾輩は猫である - Qdrant インデックス作成")
+    print(f"🐱 吾輩は猫である - Qdrant インデックス作成 (lang={lang})")
     print("=" * 60)
 
     # OpenAI クライアント初期化
@@ -184,10 +199,10 @@ def main():
     dimension = get_embedding_dimension(openai_client, EMBED_MODEL)
 
     # コレクション作成
-    create_collection(qdrant, COLLECTION_NAME, dimension)
+    create_collection(qdrant, collection_name, dimension)
 
     # チャンクを読み込み
-    chunks = load_chunks(CHUNKS_FILE)
+    chunks = load_chunks(chunks_file)
 
     # 統計情報を表示
     print_statistics(chunks)
@@ -197,15 +212,15 @@ def main():
         qdrant=qdrant,
         openai_client=openai_client,
         chunks=chunks,
-        collection_name=COLLECTION_NAME,
+        collection_name=collection_name,
         embed_model=EMBED_MODEL,
         batch_size=BATCH_SIZE
     )
 
     # 最終確認
     print("\n🔍 コレクション情報:")
-    collection_info = qdrant.get_collection(COLLECTION_NAME)
-    print(f"  コレクション名: {collection_info.config.params}")
+    collection_info = qdrant.get_collection(collection_name)
+    print(f"  コレクション名: {collection_name}")
     print(f"  ベクトル数: {collection_info.points_count}")
     print(f"  ベクトル次元: {collection_info.config.params.vectors.size}")
 

@@ -22,15 +22,18 @@ TARGET_CHUNK = 1000  # 目標
 MIN_CHUNK    = 600   # これ未満は次にくっつける
 MAX_CHUNK    = 1400  # これを超えたら必ず分割
 
+# ========= 英語チャンク長 =========
+TARGET_CHUNK_EN = 2000
+MIN_CHUNK_EN    = 1200
+MAX_CHUNK_EN    = 2800
+
 # ========= パス =========
 DATA_DIR   = Path(__file__).resolve().parents[1] / "data"
-MAIN_TXT   = DATA_DIR / "main.txt"
-OUT_JSONL  = DATA_DIR / "chunks.jsonl"
-NER_CACHE  = DATA_DIR / "ner_cache.json"  # LLM抽出のキャッシュ
 
 # ========= 章見出し検出 =========
 KANJI_NUM   = "〇一二三四五六七八九十百千"
 CHAPTER_PAT = re.compile(rf"^\s*第\s*([0-9{KANJI_NUM}]+)\s*章\s*$")
+CHAPTER_PAT_EN = re.compile(r"^\s*Chapter\s+(\d+)\s*$", re.IGNORECASE)
 
 # ========= 許可キャラクター（正規名） =========
 ALLOWED_NAMES: List[str] = [
@@ -91,6 +94,54 @@ ALIASES: Dict[str, str] = {
     "やっちゃん": "八っちゃん",
 }
 
+# ========= 英語版キャラクター名 =========
+ALLOWED_NAMES_EN: List[str] = [
+    "the Cat",
+    "Mikeko",
+    "Kuro",
+    "Shiro",
+    "Kushami",
+    "Meitei",
+    "Kangetsu",
+    "Tofu",
+    "Dokusen",
+    "Dr. Amaki",
+    "Kaneda",
+    "Kaneda Hanako",
+    "Kaneda Tomiko",
+    "Suzuki Tojuro",
+    "Tatara Sampei",
+    "Makiyama",
+    "Mrs. Kushami",
+    "Tonko",
+    "Sunko",
+    "Menko",
+    "Osan",
+    "Yukie",
+    "the koto teacher",
+    "Furui Buemon",
+    "Yoshida Torazo",
+    "the thief",
+    "Hatchan",
+]
+
+ALIASES_EN: Dict[str, str] = {
+    "Mr. Kushami": "Kushami",
+    "Mr. Sneeze": "Kushami",
+    "Sneeze": "Kushami",
+    "the master": "Kushami",
+    "Mrs. Kaneda": "Kaneda Hanako",
+    "Hanako": "Kaneda Hanako",
+    "Tomiko": "Kaneda Tomiko",
+    "Tojuro": "Suzuki Tojuro",
+    "Sampei": "Tatara Sampei",
+    "the cat": "the Cat",
+    "I": "the Cat",
+    "koto teacher": "the koto teacher",
+    "Buemon": "Furui Buemon",
+    "Torazo": "Yoshida Torazo",
+}
+
 # ========= データモデル =========
 @dataclass
 class ChunkRec:
@@ -103,14 +154,16 @@ class ChunkRec:
     text: str
 
 # ========= ユーティリティ =========
-def split_chapters(text: str) -> List[Dict]:
+def split_chapters(text: str, lang: str = "ja") -> List[Dict]:
     """章見出しがあれば分割、無ければ全体を第1章に"""
     lines = text.splitlines()
     chapters = []
-    cur_title = "第1章"
+    cur_title = "Chapter 1" if lang == "en" else "第1章"
     cur_buf = []
+    pat = CHAPTER_PAT_EN if lang == "en" else CHAPTER_PAT
+
     for ln in lines:
-        if CHAPTER_PAT.match(ln):
+        if pat.match(ln):
             if cur_buf:
                 chapters.append({"title": cur_title, "text": "\n".join(cur_buf)})
                 cur_buf = []
@@ -122,7 +175,7 @@ def split_chapters(text: str) -> List[Dict]:
 
     out = []
     for i, ch in enumerate(chapters, 1):
-        m = CHAPTER_PAT.match(ch["title"])
+        m = pat.match(ch["title"])
         num = i
         if m:
             try:
@@ -132,17 +185,24 @@ def split_chapters(text: str) -> List[Dict]:
         out.append({"chapter": num, "text": ch["text"]})
     return out or [{"chapter": 1, "text": text}]
 
+
 def sentence_split(s: str) -> List[str]:
-    """句点などで文に分割。無い場合は1文扱い。"""
+    """句点などで文に分割（日本語）。無い場合は1文扱い。"""
     parts = re.split(r'(?<=[。！？…])', s)
     out = [p.strip() for p in parts if p and p.strip()]
     return out if out else [s.strip()]
 
+
+def sentence_split_en(s: str) -> List[str]:
+    """英語の文分割"""
+    parts = re.split(r'(?<=[.!?])\s+', s)
+    out = [p.strip() for p in parts if p and p.strip()]
+    return out if out else [s.strip()]
+
+
 def split_oversize(text: str, max_len: int = MAX_CHUNK) -> List[str]:
     """
-    大きすぎる塊を“なるべく自然に”分割する。
-    1) 「、」「，」「。」「空白」「改行」「・」などの区切りでmax_lenを超えない最後の位置で切る
-    2) それでも難しければ強制スライス
+    大きすぎる塊を"なるべく自然に"分割する。
     """
     res = []
     i = 0
@@ -159,15 +219,16 @@ def split_oversize(text: str, max_len: int = MAX_CHUNK) -> List[str]:
                 window.rfind("\n"),
                 window.rfind("・"),
             )
-            if cut >= 0 and cut >= MIN_CHUNK // 2:
+            if cut >= 0 and cut >= max_len // 4:
                 end = i + cut + 1
         res.append(text[i:end])
         i = end
     return [r.strip() for r in res if r.strip()]
 
-def pack_sentences_to_chunks(sentences: List[str]) -> List[str]:
+
+def pack_sentences_to_chunks(sentences: List[str], max_chunk: int = MAX_CHUNK, min_chunk: int = MIN_CHUNK) -> List[str]:
     """
-    文列を MAX_CHUNK を超えないように順次パック（非再帰）
+    文列を max_chunk を超えないように順次パック（非再帰）
     """
     chunks = []
     buf = ""
@@ -182,9 +243,9 @@ def pack_sentences_to_chunks(sentences: List[str]) -> List[str]:
         s = sent.strip()
         if not s:
             continue
-        if len(s) > MAX_CHUNK:
+        if len(s) > max_chunk:
             flush()
-            parts = split_oversize(s, MAX_CHUNK)
+            parts = split_oversize(s, max_chunk)
             chunks.extend(parts)
             continue
 
@@ -192,10 +253,10 @@ def pack_sentences_to_chunks(sentences: List[str]) -> List[str]:
             buf = s
             continue
 
-        if len(buf) + 1 + len(s) <= MAX_CHUNK:
+        if len(buf) + 1 + len(s) <= max_chunk:
             buf = f"{buf} {s}"
         else:
-            if len(buf) < MIN_CHUNK:
+            if len(buf) < min_chunk:
                 flush()
                 buf = s
             else:
@@ -207,51 +268,57 @@ def pack_sentences_to_chunks(sentences: List[str]) -> List[str]:
     # 念のため最終チェック
     final = []
     for c in chunks:
-        if len(c) > MAX_CHUNK:
-            final.extend(split_oversize(c, MAX_CHUNK))
+        if len(c) > max_chunk:
+            final.extend(split_oversize(c, max_chunk))
         else:
             final.append(c)
     return final
 
-def load_cache() -> Dict[str, List[str]]:
-    if NER_CACHE.exists():
+def load_cache(cache_path: Path) -> Dict[str, List[str]]:
+    if cache_path.exists():
         try:
-            return json.loads(NER_CACHE.read_text(encoding="utf-8"))
+            return json.loads(cache_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
 
-def save_cache(cache: dict):
-    NER_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_cache(cache: dict, cache_path: Path):
+    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# ========= 許可名/エイリアス検出 =========
-# 日本語の"ゆるい境界"：前が和文・英数の連続文字でないこと（後ろは助詞などがつくので制限しない）
+# ========= 許可名/エイリアス検出（日本語） =========
 _JP_BOUND = r"(?<![一-龥ぁ-んァ-ンA-Za-z0-9]){name}"
 
-def _contains_name(text: str, name: str) -> bool:
-    if name == "白":
-        # 1文字は誤検出が多いので境界厳しめ（後方チェック維持）
-        pat = re.compile(rf"(?<![一-龥ぁ-んァ-ンA-Za-z0-9])白(?![一-龥ぁ-んァ-ンA-Za-z0-9])")
+def _contains_name(text: str, name: str, lang: str = "ja") -> bool:
+    if lang == "en":
+        # 英語はワード境界ベース
+        pat = re.compile(r'\b' + re.escape(name) + r'\b', re.IGNORECASE)
         return bool(pat.search(text))
-    pat = re.compile(_JP_BOUND.format(name=re.escape(name)))
-    return bool(pat.search(text))
+    else:
+        if name == "白":
+            pat = re.compile(rf"(?<![一-龥ぁ-んァ-ンA-Za-z0-9])白(?![一-龥ぁ-んァ-ンA-Za-z0-9])")
+            return bool(pat.search(text))
+        pat = re.compile(_JP_BOUND.format(name=re.escape(name)))
+        return bool(pat.search(text))
 
-def detect_allowed_names(text: str) -> Set[str]:
+def detect_allowed_names(text: str, lang: str = "ja") -> Set[str]:
+    allowed = ALLOWED_NAMES_EN if lang == "en" else ALLOWED_NAMES
+    aliases = ALIASES_EN if lang == "en" else ALIASES
+
     found: Set[str] = set()
     # 1) 正規名の直接ヒット
-    for nm in ALLOWED_NAMES:
-        if _contains_name(text, nm):
+    for nm in allowed:
+        if _contains_name(text, nm, lang):
             found.add(nm)
     # 2) エイリアス → 正規化
-    for alias, canon in ALIASES.items():
-        if _contains_name(text, alias):
+    for alias, canon in aliases.items():
+        if _contains_name(text, alias, lang):
             found.add(canon)
     return found
 
 # ========= LLM補助：許可リスト制約付き =========
 def llm_characters(client: OpenAI, text: str, allowed_names: List[str]) -> List[str]:
     """
-    allowed_names にあるキャラクター一覧の“中からのみ”、
+    allowed_names にあるキャラクター一覧の"中からのみ"、
     本文に登場する人物名を返すよう LLM に指示。
     """
     char_json = json.dumps(allowed_names, ensure_ascii=False)
@@ -278,7 +345,6 @@ def llm_characters(client: OpenAI, text: str, allowed_names: List[str]) -> List[
     try:
         arr = json.loads(content)
         if isinstance(arr, list):
-            # 念のため許可名でフィルタ
             return [n for n in arr if n in allowed_names]
     except Exception:
         pass
@@ -289,24 +355,32 @@ def build_chunks(
     text: str,
     use_llm_ner: bool=False,
     llm_limit:int=999999,
-    ner_min_heuristic:int=2
+    ner_min_heuristic:int=2,
+    lang: str="ja"
 ) -> List[ChunkRec]:
+    allowed = ALLOWED_NAMES_EN if lang == "en" else ALLOWED_NAMES
+    max_chunk = MAX_CHUNK_EN if lang == "en" else MAX_CHUNK
+    min_chunk = MIN_CHUNK_EN if lang == "en" else MIN_CHUNK
+
+    cache_path = DATA_DIR / lang / "ner_cache.json"
     client = OpenAI() if (use_llm_ner and OpenAI is not None) else None
-    cache = load_cache()
+    cache = load_cache(cache_path)
     llm_calls = 0
 
-    chapters = split_chapters(text)
+    chapters = split_chapters(text, lang=lang)
     chunks: List[ChunkRec] = []
     scene_idx = 1
     global_pos = 0
 
     for ch in chapters:
         ch_text = ch["text"]
-        sents = sentence_split(ch_text)
-        blocks = pack_sentences_to_chunks(sents)
+        if lang == "en":
+            sents = sentence_split_en(ch_text)
+        else:
+            sents = sentence_split(ch_text)
+        blocks = pack_sentences_to_chunks(sents, max_chunk=max_chunk, min_chunk=min_chunk)
 
         for block in blocks:
-            # start/end は「本文中の出現位置」を前方探索で近似
             start = text.find(block, global_pos)
             if start == -1:
                 start = global_pos
@@ -316,7 +390,7 @@ def build_chunks(
             scene_id = f"scene_{scene_idx:05d}"
 
             # 1) まず許可名/エイリアスのみで検出
-            names_from_rules = sorted(detect_allowed_names(block))
+            names_from_rules = sorted(detect_allowed_names(block, lang=lang))
 
             # 2) キャッシュ or LLM補助（不足時のみ）
             if scene_id in cache:
@@ -328,13 +402,12 @@ def build_chunks(
                     and len(names_from_rules) < ner_min_heuristic
                 )
                 if need_llm:
-                    llm_names = llm_characters(client, block, ALLOWED_NAMES)
+                    llm_names = llm_characters(client, block, allowed)
                     llm_calls += 1
-                    # ルール検出とLLM検出の和集合（どちらも正規名）
                     names = sorted(set(names_from_rules) | set(llm_names))
                 else:
                     names = names_from_rules
-                cache[scene_id] = names  # キャッシュ
+                cache[scene_id] = names
 
             chunks.append(ChunkRec(
                 id=scene_id,
@@ -342,12 +415,12 @@ def build_chunks(
                 scene_index=scene_idx,
                 start_pos=int(start),
                 end_pos=int(end),
-                characters=names[:8],  # 多すぎるとノイズなので上限
+                characters=names[:8],
                 text=block.strip()
             ))
             scene_idx += 1
 
-    save_cache(cache)
+    save_cache(cache, cache_path)
     return chunks
 
 def write_jsonl(chunks: Iterable[ChunkRec], out_path: Path):
@@ -361,17 +434,22 @@ def main():
     parser.add_argument("--llm-ner", action="store_true", help="LLMで人物名抽出を補助（最終的には許可リストでフィルタ）")
     parser.add_argument("--llm-ner-limit", type=int, default=999999, help="LLMに投げる最大シーン数")
     parser.add_argument("--ner-min-heuristic", type=int, default=2, help="ルール検出がこの人数未満ならLLM補助を使う")
+    parser.add_argument("--lang", type=str, default="ja", help="Language: 'ja' or 'en'")
     args = parser.parse_args()
 
-    text = MAIN_TXT.read_text(encoding="utf-8")
+    main_txt = DATA_DIR / args.lang / "main.txt"
+    out_jsonl = DATA_DIR / args.lang / "chunks.jsonl"
+
+    text = main_txt.read_text(encoding="utf-8")
     chunks = build_chunks(
         text,
         use_llm_ner=args.llm_ner,
         llm_limit=args.llm_ner_limit,
-        ner_min_heuristic=args.ner_min_heuristic
+        ner_min_heuristic=args.ner_min_heuristic,
+        lang=args.lang
     )
-    write_jsonl(chunks, OUT_JSONL)
-    print(f"✅ wrote {OUT_JSONL} ({len(chunks)} chunks)")
+    write_jsonl(chunks, out_jsonl)
+    print(f"✅ wrote {out_jsonl} ({len(chunks)} chunks)")
 
 if __name__ == "__main__":
     main()

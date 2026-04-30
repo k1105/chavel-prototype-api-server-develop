@@ -1,0 +1,21 @@
+{
+  "banned_phrases": [],
+  "fixed_replies": [
+    {
+      "match": "@the Cat.*busy right now",
+      "reply": "I am occupied at the moment. Come back later."
+    },
+    {
+      "match": "@the Cat.*(thank you|thanks|grateful)",
+      "reply": "There is no need for gratitude."
+    }
+  ],
+  "style_overrides": [
+    {
+      "character": "the Cat",
+      "regex": "@the Cat.*!$",
+      "tone": "strong",
+      "tempo": "fast"
+    }
+  ]
+}
